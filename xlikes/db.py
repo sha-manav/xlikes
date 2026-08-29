@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 DEFAULT_DB = Path(os.environ.get("XLIKES_DB", Path.home() / ".xlikes" / "likes.db"))
@@ -77,11 +78,28 @@ _MERGE_COLS = (
 ).split()
 
 
+def _check_fts5(conn: sqlite3.Connection) -> None:
+    """Full-text search is the whole point, so fail with something actionable
+    rather than a syntax error from deep inside a CREATE statement."""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp.fts5_probe USING fts5(x)")
+        conn.execute("DROP TABLE temp.fts5_probe")
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"This Python's SQLite was built without the FTS5 extension ({exc}).\n"
+            f"  python: {sys.executable}\n"
+            f"  sqlite: {sqlite3.sqlite_version}\n"
+            "Installing Python from python.org or Homebrew (`brew install python`) "
+            "gets you a build that includes it."
+        ) from exc
+
+
 def connect(path: Path | str | None = None) -> sqlite3.Connection:
     path = Path(path) if path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
+    _check_fts5(conn)
     conn.executescript(SCHEMA)
     return conn
 

@@ -9,10 +9,36 @@ profile, the posts live in `~/.xlikes/likes.db`, and nothing is sent anywhere.
 
 ## Setup
 
+Needs Python 3.10 or newer — check with `python3 -V`. If it's older, `brew install python`.
+
 ```bash
-git clone https://github.com/sha-manav/xlikes && cd xlikes
-pip install -e .
-pip install playwright && playwright install chromium
+git clone https://github.com/sha-manav/xlikes
+cd xlikes
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e .
+python3 -m pip install playwright
+python3 -m playwright install chromium
+```
+
+macOS has no bare `pip` command, hence `python3 -m pip`. The virtualenv is what
+puts `xlikes` on your PATH; in a new terminal, re-activate it first:
+
+```bash
+source ~/xlikes/.venv/bin/activate
+```
+
+If you'd rather not bother, run it straight out of the repo directory instead —
+searching needs nothing but the standard library:
+
+```bash
+python3 -m xlikes.cli search --quotes --articles --recent 200
+```
+
+An alias saves the typing:
+
+```bash
+echo "alias xlikes='$HOME/xlikes/.venv/bin/xlikes'" >> ~/.zshrc && source ~/.zshrc
 ```
 
 ## Pull your likes
