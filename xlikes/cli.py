@@ -93,6 +93,7 @@ def cmd_fetch(args, conn) -> int:
             max_posts=args.max,
             headless=args.headless,
             profile_dir=args.profile,
+            channel=None if args.browser == "chromium" else args.browser,
         )
     except FetchError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -211,6 +212,8 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--max", type=int, default=600, help="how many likes to walk back (default 600)")
     f.add_argument("--headless", action="store_true", help="no visible window (only after first login)")
     f.add_argument("--profile", help="browser profile dir (default ~/.xlikes/browser-profile)")
+    f.add_argument("--browser", choices=["chromium", "chrome", "msedge"],
+                   help="which browser to drive (default: whichever is available)")
     f.set_defaults(func=cmd_fetch)
 
     a = sub.add_parser("import-archive", help="import like.js from an X data archive")

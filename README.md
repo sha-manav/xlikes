@@ -21,6 +21,12 @@ python3 -m pip install playwright
 python3 -m playwright install chromium
 ```
 
+That last step downloads about 140MB of Chromium and sometimes stalls. It's
+optional: if you already have Google Chrome (or Edge), skip it — `xlikes fetch`
+falls back to whichever browser it finds, and drives it with its own separate
+profile, leaving your everyday browsing untouched. Force a specific one with
+`xlikes fetch --browser chrome`.
+
 macOS has no bare `pip` command, hence `python3 -m pip`. The virtualenv is what
 puts `xlikes` on your PATH; in a new terminal, re-activate it first:
 

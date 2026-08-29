@@ -44,6 +44,46 @@ class FetchError(RuntimeError):
     pass
 
 
+# Playwright's own Chromium is a ~140MB download that likes to stall. Falling
+# back to a browser you already have avoids blocking on it.
+BROWSER_CHANNELS = (None, "chrome", "msedge")
+CHANNEL_NAMES = {None: "Playwright's Chromium", "chrome": "Google Chrome", "msedge": "Microsoft Edge"}
+
+
+def _launch(p, profile_dir: Path, headless: bool, channel: str | None):
+    """Own profile dir per browser: Chrome and Chromium don't share cleanly."""
+    target = profile_dir / (channel or "chromium")
+    target.mkdir(parents=True, exist_ok=True)
+    return p.chromium.launch_persistent_context(
+        str(target),
+        headless=headless,
+        channel=channel,
+        viewport={"width": 1280, "height": 950},
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+
+
+def _launch_any(p, profile_dir: Path, headless: bool, channel: str | None, verbose: bool):
+    attempts = [channel] if channel else list(BROWSER_CHANNELS)
+    failures = []
+    for candidate in attempts:
+        try:
+            context = _launch(p, profile_dir, headless, candidate)
+        except Exception as exc:
+            failures.append(f"  {CHANNEL_NAMES.get(candidate, candidate)}: {str(exc).splitlines()[0][:120]}")
+            continue
+        if verbose and candidate:
+            print(f"  Using {CHANNEL_NAMES.get(candidate, candidate)}.")
+        return context
+    raise FetchError(
+        "Couldn't start a browser. Tried:\n"
+        + "\n".join(failures)
+        + "\n\nEither finish the Chromium download:\n"
+        "    python3 -m playwright install chromium\n"
+        "or install Google Chrome and re-run — it'll be picked up automatically."
+    )
+
+
 def _require_playwright():
     try:
         from playwright.sync_api import sync_playwright
@@ -91,6 +131,7 @@ def fetch_likes(
     max_posts: int = 600,
     headless: bool = False,
     profile_dir: Path | None = None,
+    channel: str | None = None,
     scroll_pause_ms: int = 1400,
     verbose: bool = True,
 ) -> dict:
@@ -112,12 +153,7 @@ def fetch_likes(
         ingest(collected, payload)
 
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=headless,
-            viewport={"width": 1280, "height": 950},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        context = _launch_any(p, profile_dir, headless, channel, verbose)
         page = context.pages[0] if context.pages else context.new_page()
         page.on("response", on_response)
 
