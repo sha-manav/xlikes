@@ -59,7 +59,7 @@ def test_search_finds_the_quoted_article_praise(tmp_path):
     bm25 puts it first; the proximity ladder is what surfaces the right one.
     """
     conn = build_index(tmp_path)
-    rows, relaxed = smart_search(conn, "article really good")
+    rows, relaxed, total = smart_search(conn, "article really good")
     assert not relaxed
     assert rows[0]["id"] == "1900000000000000010"
     assert rows[0]["author_handle"] == "simonw"
@@ -83,20 +83,20 @@ def test_filters(tmp_path):
 def test_relaxes_when_a_remembered_word_is_wrong(tmp_path):
     conn = build_index(tmp_path)
     assert search(conn, "article really good flibbertigibbet") == []
-    rows, relaxed = smart_search(conn, "article really good flibbertigibbet")
+    rows, relaxed, _ = smart_search(conn, "article really good flibbertigibbet")
     assert relaxed and rows[0]["id"] == "1900000000000000010"
 
 
 def test_exact_phrase_outranks_a_shorter_looser_match(tmp_path):
     conn = build_index(tmp_path)
-    rows, _ = smart_search(conn, "really good")
+    rows, _, _ = smart_search(conn, "really good")
     # both posts contain the phrase; the ladder must still return both
     assert {r["author_handle"] for r in rows} == {"simonw", "dhh"}
 
 
 def test_smart_search_respects_filters(tmp_path):
     conn = build_index(tmp_path)
-    rows, _ = smart_search(conn, "really good", quotes_only=True)
+    rows, _, _ = smart_search(conn, "really good", quotes_only=True)
     assert [r["author_handle"] for r in rows] == ["simonw"]
 
 
@@ -175,3 +175,18 @@ def test_handle_parsed_from_account_switcher_label():
     assert handle_from_text("Manav Shah\n@sha_manav") == "sha_manav"
     assert handle_from_text("Account menu") is None
     assert handle_from_text(None) is None
+
+
+def test_reports_the_true_match_count_when_truncating(tmp_path):
+    """Capping at -n must never look like "that's everything there is"."""
+    conn = build_index(tmp_path)
+    rows, _, total = smart_search(conn, "good", limit=1)
+    assert len(rows) == 1 and total == 3
+
+    rows, _, total = smart_search(conn, None, limit=2, articles_only=True)
+    assert len(rows) == 2 and total == 2
+
+    from xlikes.search import count
+    assert count(conn) == 3
+    assert count(conn, quotes_only=True) == 1
+    assert count(conn, articles_only=True, recent=1) == 1

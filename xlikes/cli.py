@@ -135,7 +135,7 @@ def cmd_search(args, conn) -> int:
     query = " ".join(args.query).strip() or None
     mode = "any" if args.any else "all"
     try:
-        rows, relaxed = search_mod.smart_search(conn, query, mode=mode, **kwargs)
+        rows, relaxed, total = search_mod.smart_search(conn, query, mode=mode, **kwargs)
     except Exception as exc:
         print(f"error: bad search query ({exc})", file=sys.stderr)
         return 1
@@ -151,10 +151,21 @@ def cmd_search(args, conn) -> int:
             print(f"({total} likes indexed. Try fewer words, or --any to match any of them.)")
         return 1
 
+    indexed = search_mod.count(conn)
+    if args.recent and args.recent > indexed:
+        print(style.yellow(f"note: --recent {args.recent} but only {indexed} likes are indexed") +
+              style.dim(f" — run `xlikes fetch --max {max(args.recent, indexed * 2)}` to go further back\n"))
     if relaxed:
         print(style.dim("No post had all of those words — showing best partial matches:\n"))
     print_results(rows, style, query, show_full=args.full)
-    print(style.dim(f"{len(rows)} result{'s' if len(rows) != 1 else ''}"))
+
+    shown, cap = len(rows), search_mod.COUNT_CAP
+    if total > shown:
+        amount = f"{cap}+" if total >= cap else str(total)
+        print(style.yellow(f"showing {shown} of {amount} matches") +
+              style.dim(f" — add -n {min(total, 100)} to see more"))
+    else:
+        print(style.dim(f"{shown} result{'s' if shown != 1 else ''}"))
     return 0
 
 

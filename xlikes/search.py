@@ -66,6 +66,30 @@ def build_match(query: str, mode: str = "all") -> str:
     return (" OR " if mode == "any" else " AND ").join(_terms(query))
 
 
+def _filters(kwargs: dict) -> tuple[list[str], list]:
+    where, params = [], []
+    if since := kwargs.get("since"):
+        where.append("l.created_at >= ?")
+        params.append(since)
+    if until := kwargs.get("until"):
+        where.append("l.created_at <= ?")
+        params.append(until)
+    if author := kwargs.get("author"):
+        where.append("(lower(l.author_handle) LIKE ? OR lower(l.author_name) LIKE ?)")
+        needle = f"%{author.lstrip('@').lower()}%"
+        params += [needle, needle]
+    if kwargs.get("quotes_only"):
+        where.append("l.is_quote = 1")
+    if kwargs.get("articles_only"):
+        where.append("l.has_article = 1")
+    if kwargs.get("links_only"):
+        where.append("COALESCE(l.urls,'') != ''")
+    if (recent := kwargs.get("recent")) is not None:
+        where.append("l.like_rank IS NOT NULL AND l.like_rank < ?")
+        params.append(recent)
+    return where, params
+
+
 def search(
     conn: sqlite3.Connection,
     query: str | None = None,
@@ -81,30 +105,10 @@ def search(
     recent: int | None = None,
     limit: int = 20,
 ) -> list[sqlite3.Row]:
-    where, params = [], []
+    where, params = _filters(locals())
     if query:
-        match = query if raw else build_match(query, mode)
-        where.append("likes_fts MATCH ?")
-        params.append(match)
-    if since:
-        where.append("l.created_at >= ?")
-        params.append(since)
-    if until:
-        where.append("l.created_at <= ?")
-        params.append(until)
-    if author:
-        where.append("(lower(l.author_handle) LIKE ? OR lower(l.author_name) LIKE ?)")
-        needle = f"%{author.lstrip('@').lower()}%"
-        params += [needle, needle]
-    if quotes_only:
-        where.append("l.is_quote = 1")
-    if articles_only:
-        where.append("l.has_article = 1")
-    if links_only:
-        where.append("COALESCE(l.urls,'') != ''")
-    if recent is not None:
-        where.append("l.like_rank IS NOT NULL AND l.like_rank < ?")
-        params.append(recent)
+        where.insert(0, "likes_fts MATCH ?")
+        params.insert(0, query if raw else build_match(query, mode))
 
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     if query:
@@ -128,6 +132,13 @@ def search(
             LIMIT ?
         """
     return conn.execute(sql, [*params, limit]).fetchall()
+
+
+def count(conn: sqlite3.Connection, **kwargs) -> int:
+    """How many likes match the filters, ignoring any result limit."""
+    where, params = _filters(kwargs)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    return conn.execute(f"SELECT COUNT(*) c FROM likes l {clause}", params).fetchone()["c"]
 
 
 def _rungs(terms: list[str]) -> list[str]:
@@ -154,6 +165,9 @@ def _run(conn, match: str, limit: int, kwargs: dict):
         return []  # a rung this tokenizer won't accept; looser ones still apply
 
 
+COUNT_CAP = 500  # how deep we look to report "N matches"; display caps at "500+"
+
+
 def _collect(conn, term_sets: list[list[str]], limit: int, kwargs: dict, seen: set):
     """Walk every rung across every term set, precision rung by precision rung,
     so a phrase hit in one set still outranks a loose hit in another."""
@@ -173,35 +187,41 @@ def _collect(conn, term_sets: list[list[str]], limit: int, kwargs: dict, seen: s
 
 
 def smart_search(conn, query: str | None, *, limit: int = 20, mode: str = "all", **kwargs):
-    """Find posts by half-remembered wording. Returns (rows, relaxed).
+    """Find posts by half-remembered wording. Returns (rows, relaxed, total).
 
     relaxed is True when no post contained everything you typed and the search
-    had to loosen — usually because one remembered word wasn't the real one.
+    had to loosen. total is how many matched overall, so the caller can say when
+    it's only showing the first page — silently truncating looks like "that's
+    all there is", which is worse than no result at all.
     """
+    depth = max(limit, COUNT_CAP)
     if not query:
-        return search(conn, None, limit=limit, **kwargs), False
+        return search(conn, None, limit=limit, **kwargs), False, count(conn, **kwargs)
     if kwargs.get("raw"):
-        return search(conn, query, limit=limit, **kwargs), False
+        rows = search(conn, query, limit=depth, **kwargs)
+        return rows[:limit], False, len(rows)
     kwargs.pop("raw", None)
 
     terms = _terms(query)
     if mode == "any":
-        return _rank_by_coverage(conn, terms, limit, kwargs), False
+        rows = _rank_by_coverage(conn, terms, depth, kwargs)
+        return rows[:limit], False, len(rows)
 
     seen: set = set()
-    rows = _collect(conn, [terms], limit, kwargs, seen)
+    rows = _collect(conn, [terms], depth, kwargs, seen)
     if rows:
-        return rows[:limit], False
+        return rows[:limit], False, len(rows)
 
     # Nothing matched every word — drop one word at a time. A single wrong word
     # in a remembered quote shouldn't sink the whole search.
     if 2 < len(terms) <= 6:
         subsets = [terms[:i] + terms[i + 1:] for i in range(len(terms))]
-        rows = _collect(conn, subsets, limit, kwargs, seen)
+        rows = _collect(conn, subsets, depth, kwargs, seen)
         if rows:
-            return rows[:limit], True
+            return rows[:limit], True, len(rows)
 
-    return _rank_by_coverage(conn, terms, limit, kwargs), True
+    rows = _rank_by_coverage(conn, terms, depth, kwargs)
+    return rows[:limit], True, len(rows)
 
 
 def _rank_by_coverage(conn, terms: list[str], limit: int, kwargs: dict):
@@ -210,12 +230,12 @@ def _rank_by_coverage(conn, terms: list[str], limit: int, kwargs: dict):
     bm25 alone favours short posts, so a one-word coincidence would beat a post
     matching four of five words.
     """
-    rows = _run(conn, " OR ".join(terms), max(limit * 5, 50), kwargs)
+    rows = _run(conn, " OR ".join(terms), max(limit, 50), kwargs)
     if not rows:
         return []
     coverage: dict[str, int] = {}
     for term in terms:
-        for row in _run(conn, term, max(limit * 5, 50), kwargs):
+        for row in _run(conn, term, max(limit, 50), kwargs):
             coverage[row["id"]] = coverage.get(row["id"], 0) + 1
     rows.sort(key=lambda r: (-coverage.get(r["id"], 0), r["score"]))
-    return rows[:limit]
+    return rows
