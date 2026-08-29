@@ -156,3 +156,22 @@ def test_ingest_preserves_like_order_and_dedupes():
     assert ingest(collected, FIXTURE) == 3
     assert ingest(collected, FIXTURE) == 0  # same page scrolled past twice
     assert list(collected)[0] == "1900000000000000010"
+
+
+def test_login_detection_needs_the_auth_cookie():
+    from xlikes.fetch import is_logged_in
+
+    assert is_logged_in([{"name": "auth_token", "value": "abc123"}])
+    assert not is_logged_in([])
+    assert not is_logged_in([{"name": "auth_token", "value": ""}])
+    # a logged-out visit still sets these, and must not read as signed in
+    assert not is_logged_in([{"name": "guest_id", "value": "v1%3A1"},
+                             {"name": "ct0", "value": "deadbeef"}])
+
+
+def test_handle_parsed_from_account_switcher_label():
+    from xlikes.fetch import handle_from_text
+
+    assert handle_from_text("Manav Shah\n@sha_manav") == "sha_manav"
+    assert handle_from_text("Account menu") is None
+    assert handle_from_text(None) is None

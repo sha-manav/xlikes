@@ -8,6 +8,7 @@ the posts land in a local SQLite file.
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,33 +96,69 @@ def _require_playwright():
     return sync_playwright
 
 
-def _wait_for_login(page, timeout_s: int = 300) -> None:
+def is_logged_in(cookies) -> bool:
+    """X sets auth_token on a real session.
+
+    URL checks aren't enough: a logged-out visit to /home lands on the marketing
+    splash at x.com, not on anything named /login, so a missing session used to
+    sail straight through and fail later with a confusing error.
+    """
+    return any(c.get("name") == "auth_token" and c.get("value") for c in cookies)
+
+
+def _wait_for_login(context, page, timeout_s: int = 300) -> None:
     page.goto("https://x.com/home", wait_until="domcontentloaded")
+    page.wait_for_timeout(1200)
+    if is_logged_in(context.cookies()):
+        return
+
+    print("\n  Not signed in yet — log in to X in the browser window that just opened.")
+    print("  Waiting… (the session is saved, so this is a one-time step)\n")
     deadline = datetime.now(timezone.utc).timestamp() + timeout_s
-    warned = False
-    while "/login" in page.url or "/i/flow/" in page.url:
-        if not warned:
-            print("\n  Log in to X in the browser window that just opened.")
-            print("  Waiting… (the session is saved, so this is a one-time step)\n")
-            warned = True
-        if datetime.now(timezone.utc).timestamp() > deadline:
-            raise FetchError("timed out waiting for login")
+    while datetime.now(timezone.utc).timestamp() < deadline:
         page.wait_for_timeout(2000)
-        if "/login" in page.url or "/i/flow/" in page.url:
-            try:
+        if is_logged_in(context.cookies()):
+            print("  Signed in.")
+            try:  # reload so the logged-in nav (and your handle) renders
                 page.goto("https://x.com/home", wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
             except Exception:
                 pass
+            return
+    raise FetchError("timed out waiting for login")
 
 
-def _discover_handle(page) -> str | None:
-    for selector in ('a[data-testid="AppTabBar_Profile_Link"]', 'a[aria-label="Profile"]'):
-        try:
-            href = page.get_attribute(selector, "href", timeout=5000)
-        except Exception:
-            continue
-        if href:
-            return href.strip("/").split("/")[0]
+def handle_from_text(text: str | None) -> str | None:
+    """Pull @handle out of the account switcher's label."""
+    if not text:
+        return None
+    match = re.search(r"@([A-Za-z0-9_]{1,15})", text)
+    return match.group(1) if match else None
+
+
+def _discover_handle(page, attempts: int = 3) -> str | None:
+    """Read your own handle off the logged-in chrome of the page.
+
+    Several routes, because which ones render depends on window size and on
+    whichever markup X is shipping this week.
+    """
+    for attempt in range(attempts):
+        for selector in ('a[data-testid="AppTabBar_Profile_Link"]', 'a[aria-label="Profile"]'):
+            try:
+                href = page.get_attribute(selector, "href", timeout=4000)
+            except Exception:
+                continue
+            if href and href.strip("/"):
+                return href.strip("/").split("/")[0]
+        for selector in ('[data-testid="SideNav_AccountSwitcher_Button"]', 'header[role="banner"]'):
+            try:
+                handle = handle_from_text(page.inner_text(selector, timeout=4000))
+            except Exception:
+                continue
+            if handle:
+                return handle
+        if attempt + 1 < attempts:
+            page.wait_for_timeout(2000)
     return None
 
 
@@ -157,11 +194,14 @@ def fetch_likes(
         page = context.pages[0] if context.pages else context.new_page()
         page.on("response", on_response)
 
-        _wait_for_login(page)
+        _wait_for_login(context, page)
         handle = (handle or _discover_handle(page) or "").lstrip("@")
         if not handle:
             context.close()
-            raise FetchError("couldn't work out your handle — pass --handle yourhandle")
+            raise FetchError(
+                "Signed in, but couldn't read your handle off the page.\n"
+                "Pass it explicitly:  xlikes fetch --handle yourhandle"
+            )
 
         if verbose:
             print(f"  Reading likes for @{handle} (target: {max_posts} posts)")
@@ -187,8 +227,11 @@ def fetch_likes(
 
     if not collected:
         raise FetchError(
-            "No likes captured. Check that the Likes tab actually loaded, and that "
-            "you're logged in as the account that owns them."
+            f"No likes captured from x.com/{handle}/likes.\n"
+            "  - Is that the right handle? Pass --handle to set it explicitly.\n"
+            "  - You can only read your own likes, so it must be the account you "
+            "logged in as.\n"
+            "  - If the tab was still loading, just run it again."
             + (f"\nResponse errors: {errors[0]}" if errors else "")
         )
 
