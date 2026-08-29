@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+# local data — never commit your likes or browser session
+*.db
+data/
+browser-profile/
