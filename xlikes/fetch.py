@@ -716,6 +716,8 @@ def fetch_user_search(
     replies: str = "include",
     windows: list | None = None,
     order: str = "newest",
+    fill_gaps: bool = False,
+    min_gap_days: int = 3,
     headless: bool = False,
     profile_dir: Path | None = None,
     channel: str | None = None,
@@ -776,6 +778,7 @@ def fetch_user_search(
     attempted: set[tuple[str, str]] = set()
     cursor = end_date
     windows_done, extra, empty_streak, truncated = 0, 0, 0, []
+    examined = None
     started = time.monotonic()
 
     with sync_playwright() as p:
@@ -797,6 +800,38 @@ def fetch_user_search(
                     print(f"  account created {floor.isoformat()} — walking back to there")
             if since_date:
                 floor = max(floor, since_date)
+
+            if fill_gaps:
+                stored_days = {
+                    row["day"] for row in conn.execute(
+                        "SELECT DISTINCT substr(created_at,1,10) day FROM posts "
+                        "WHERE handle = ? AND created_at IS NOT NULL", (target,))
+                }
+                # Anchor on the account's first day. Anchoring on the oldest
+                # post already stored would make everything before it invisible
+                # — which is usually the whole gap you're trying to fill.
+                gap_start = gap_anchor(since, profile.get("created_at"), stored_days)
+                if not gap_start:
+                    raise FetchError(
+                        "Can't work out where this account's history starts: no posts "
+                        "stored, and the profile didn't report a creation date.\n"
+                        "Pass --since (e.g. --since 2025-10-01)."
+                    )
+                gap_end = (until or "")[:10] or (date.today() + timedelta(days=1)).isoformat()
+                plan = gap_windows(stored_days, gap_start, gap_end, window_days, min_gap_days)
+                examined = (gap_start, gap_end)
+                pending = [(w_start, w_end, False) for w_start, w_end in plan]
+                if order == "oldest":
+                    pending.reverse()
+                planned = len(pending) or None
+                open_ended = False
+                if verbose:
+                    if pending:
+                        print(f"  {len(pending)} window(s) with no posts stored "
+                              f"between {gap_start} and {gap_end}")
+                    else:
+                        print(f"  {gap_start} \u2192 {gap_end} is already covered "
+                              f"(no blanks of {min_gap_days}+ days)")
 
             while len(collected) < max_posts:
                 if not pending:
@@ -865,6 +900,7 @@ def fetch_user_search(
         windows=windows_done,
         continuations=extra,
         truncated=truncated,
+        examined=examined,
         missing_views=sum(1 for r in collected.values() if r.get("views") is None),
         skipped_other_authors=sum(n for h, n in seen_handles.items() if h != target),
         operations=seen_ops,
@@ -873,6 +909,20 @@ def fetch_user_search(
     if not collected:
         stats["error"] = no_posts_message(target, [], seen_handles, seen_ops, errors)
     return stats
+
+
+def gap_anchor(since: str | None, profile_created_at: str | None, stored_days: set) -> str | None:
+    """Which day gap-filling should start from.
+
+    The account's first day, not the oldest post already stored: anchoring on
+    stored data makes everything older than it invisible, which is usually the
+    entire gap being filled. Falling back to the oldest stored day is a last
+    resort that can only find gaps *within* what we already have.
+    """
+    for candidate in (since, profile_created_at):
+        if candidate:
+            return candidate[:10]
+    return min(stored_days) if stored_days else None
 
 
 def gap_ranges(stored_days: set, start: str, end: str, min_gap_days: int = 3) -> list:

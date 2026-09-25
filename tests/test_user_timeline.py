@@ -512,9 +512,24 @@ def test_oldest_first_ordering_puts_the_missing_history_first():
     assert oldest_first[0][0] == "2025-10-17"       # what --order oldest does
 
 
-def test_fill_gaps_refuses_without_a_starting_point(tmp_path):
-    conn = db.connect(tmp_path / "empty.db")
-    conn.close()
-    result = _cli(tmp_path / "empty.db", "user", "nobody", "--mode", "search", "--fill-gaps")
-    assert result.returncode == 1
-    assert "no --since given" in result.stderr
+def test_gap_filling_anchors_on_the_accounts_first_day():
+    """The bug this fixes: with no account row, gap-filling anchored on the
+    oldest post already stored, so the whole span before it — the actual gap —
+    was never examined, and it reported nothing to do."""
+    from xlikes.fetch import gap_anchor, gap_windows
+
+    stored = {f"2026-03-{d:02d}" for d in range(1, 29)}
+
+    # the profile's creation date wins over stored data
+    assert gap_anchor(None, "2025-10-17T08:12:00+00:00", stored) == "2025-10-17"
+    # an explicit --since wins over everything
+    assert gap_anchor("2025-09-01T00:00:00+00:00", "2025-10-17", stored) == "2025-09-01"
+    # last resort only, and it can only find gaps inside what we have
+    assert gap_anchor(None, None, stored) == "2026-03-01"
+    assert gap_anchor(None, None, set()) is None
+
+    # anchored on the account: the missing months are found
+    anchored = gap_windows(stored, gap_anchor(None, "2025-10-17", stored), "2026-03-29", 5)
+    assert anchored and min(s for s, _ in anchored) == "2025-10-17"
+    # anchored on stored data: nothing to do, which is the wrong answer
+    assert gap_windows(stored, gap_anchor(None, None, stored), "2026-03-29", 5) == []

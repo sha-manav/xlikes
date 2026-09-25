@@ -221,8 +221,10 @@ first:
 xlikes user Damnang2 --mode search --fill-gaps --window 5
 ```
 
-It reads what's already in the database, finds runs of days with no posts
-between the account's creation and today, and searches only those. Silences
+It loads the profile first to learn when the account was created, then searches
+the runs of days with no posts between that day and today. The account's first
+day is the anchor deliberately: anchoring on the oldest post already stored
+would hide everything older than it, which is usually the entire gap. Silences
 shorter than `--min-gap` days (3 by default) are treated as a quiet stretch
 rather than a gap, since no account posts every single day.
 
