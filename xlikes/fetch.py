@@ -714,6 +714,8 @@ def fetch_user_search(
     max_posts: int = 20000,
     max_empty_windows: int = 8,
     replies: str = "include",
+    windows: list | None = None,
+    order: str = "newest",
     headless: bool = False,
     profile_dir: Path | None = None,
     channel: str | None = None,
@@ -761,8 +763,15 @@ def fetch_user_search(
         sink.write(collect_posts(payload, target, collected, seen_handles))
 
     pending: list[tuple[str, str, bool]] = []  # (start, end, is_continuation)
-    if not open_ended:
+    if windows is not None:
+        pending = [(s, e, False) for s, e in windows]
+        open_ended = False
+    elif not open_ended:
         pending = [(s, e, False) for s, e in date_windows(since_date, end_date, window_days)]
+    if order == "oldest":
+        # Oldest first, so the history you're missing arrives before the
+        # recent months you probably already have.
+        pending.reverse()
     planned = len(pending) or None
     attempted: set[tuple[str, str]] = set()
     cursor = end_date
@@ -864,3 +873,43 @@ def fetch_user_search(
     if not collected:
         stats["error"] = no_posts_message(target, [], seen_handles, seen_ops, errors)
     return stats
+
+
+def gap_ranges(stored_days: set, start: str, end: str, min_gap_days: int = 3) -> list:
+    """Runs of at least `min_gap_days` consecutive days with nothing stored.
+
+    Walking the whole history newest-first puts the months you're missing last,
+    which is backwards when the point is to fill a hole. This finds the holes.
+
+    A one- or two-day silence is normal for any account, so short runs are
+    ignored; only sustained blanks are treated as gaps worth re-scanning.
+    """
+    runs, current = [], None
+    day, last = date.fromisoformat(start), date.fromisoformat(end)
+    while day < last:
+        key = day.isoformat()
+        if key in stored_days:
+            if current:
+                runs.append((current, key))
+                current = None
+        elif current is None:
+            current = key
+        day += timedelta(days=1)
+    if current:
+        runs.append((current, end))
+    return [
+        (a, b) for a, b in runs
+        if (date.fromisoformat(b) - date.fromisoformat(a)).days >= min_gap_days
+    ]
+
+
+def gap_windows(stored_days: set, start: str, end: str, window_days: int,
+                min_gap_days: int = 3) -> list:
+    """Search windows covering only the days with nothing stored."""
+    windows = []
+    for range_start, range_end in gap_ranges(stored_days, start, end, min_gap_days):
+        windows.extend(
+            date_windows(date.fromisoformat(range_start), date.fromisoformat(range_end),
+                         window_days)
+        )
+    return windows

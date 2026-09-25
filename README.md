@@ -210,6 +210,22 @@ the search walk — it stops at the account's first day instead of inferring the
 end from empty windows, and months before the account existed are never
 reported as gaps.
 
+### Filling in what's missing
+
+A plain search pass walks newest-first, so the history you're missing arrives
+last — the wrong order when you already have the recent months from the
+timeline pass. `--fill-gaps` scans only the days with nothing stored, oldest
+first:
+
+```bash
+xlikes user Damnang2 --mode search --fill-gaps --window 5
+```
+
+It reads what's already in the database, finds runs of days with no posts
+between the account's creation and today, and searches only those. Silences
+shorter than `--min-gap` days (3 by default) are treated as a quiet stretch
+rather than a gap, since no account posts every single day.
+
 `user-coverage` is how you check rather than assume — it prints a per-month
 histogram and lists months holding nothing, with the command to re-scan one.
 A quiet month and a missed month look the same in the data, so it names both

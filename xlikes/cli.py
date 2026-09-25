@@ -240,13 +240,26 @@ def cmd_user(args, conn) -> int:
         print("\nStopped at your request — skipping the search pass. "
               "Everything captured is saved; re-run to carry on.")
     if not stopped and args.mode in ("search", "both"):
-        print("\n== dated search windows (reaches what the timeline won't serve) ==")
+        windows, order = None, args.order or "newest"
+        if args.fill_gaps:
+            windows, order = _gap_plan(conn, args, since, until), args.order or "oldest"
+            if windows is None:
+                return 1
+            if not windows:
+                print("\nNo gaps of "
+                      f"{args.min_gap}+ days to fill — nothing to search.")
+                return 0
+            print(f"\n== filling {len(windows)} window(s) with no posts stored "
+                  f"({order}-first) ==")
+        else:
+            print("\n== dated search windows (reaches what the timeline won't serve) ==")
         try:
             stats = fetch_user_search(
                 conn, handle=args.handle, since=since, until=until,
                 window_days=args.window, max_posts=args.max,
                 max_empty_windows=args.max_empty,
                 replies="include" if not args.no_replies else "exclude",
+                windows=windows, order=order,
                 debug=args.debug, **shared)
             if stats.get("error") and not stats["total"]:
                 failures.append(stats["error"])
@@ -298,6 +311,33 @@ def cmd_user(args, conn) -> int:
               "reports (which includes replies and reposts, and excludes deletions)")
     print(f"  check for gaps with: xlikes user-coverage {handle}")
     return 0
+
+
+def _gap_plan(conn, args, since, until):
+    """Search windows for the days with nothing stored. None means: can't tell."""
+    from datetime import date, timedelta
+
+    from .fetch import gap_windows
+
+    handle = args.handle.lstrip("@").lower()
+    stored = {
+        row["day"] for row in conn.execute(
+            "SELECT DISTINCT substr(created_at,1,10) day FROM posts "
+            "WHERE handle = ? AND created_at IS NOT NULL", (handle,))
+    }
+    account = conn.execute(
+        "SELECT created_at FROM accounts WHERE handle = ?", (handle,)).fetchone()
+
+    start = (since or "")[:10] or (account["created_at"][:10] if account and
+                                   account["created_at"] else min(stored, default=""))
+    if not start:
+        print(f"error: nothing stored for @{handle} and no --since given, so there's "
+              "no range to fill.\n"
+              f"Run a plain pass first, or pass --since (e.g. --since 2025-10-01).",
+              file=sys.stderr)
+        return None
+    end = (until or "")[:10] or (date.today() + timedelta(days=1)).isoformat()
+    return gap_windows(stored, start, end, args.window, args.min_gap)
 
 
 def cmd_user_coverage(args, conn) -> int:
@@ -490,6 +530,14 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--until", help="newest date to search (default today)")
     u.add_argument("--window", type=int, default=14,
                    help="days per search window (default 14; lower for prolific accounts)")
+    u.add_argument("--fill-gaps", action="store_true",
+                   help="only search date ranges with no posts stored, oldest first — "
+                        "skips months you already have")
+    u.add_argument("--min-gap", type=int, default=3, metavar="DAYS",
+                   help="with --fill-gaps, ignore silences shorter than this (default 3)")
+    u.add_argument("--order", choices=["newest", "oldest"],
+                   help="which end of the range to search first "
+                        "(default: newest, or oldest with --fill-gaps)")
     u.add_argument("--max-empty", type=int, default=8, dest="max_empty",
                    help="consecutive empty windows before assuming the history ended")
     u.add_argument("--max", type=int, default=20000, help="cap on posts (default 20000)")

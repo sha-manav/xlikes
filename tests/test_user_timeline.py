@@ -461,3 +461,60 @@ def test_eta_is_omitted_when_meaningless():
     assert _eta(0.0, 0, 10) == ""      # nothing done yet
     assert _eta(0.0, 10, 10) == ""     # finished
     assert _eta(0.0, 5, 0) == ""       # unknown total (open-ended walk)
+
+
+# --- filling gaps instead of re-walking what we have ------------------------
+
+def test_gap_ranges_finds_only_sustained_blanks():
+    from xlikes.fetch import gap_ranges
+
+    stored = {f"2026-03-{d:02d}" for d in range(1, 11)}
+    # everything before the stored run is one contiguous gap
+    assert gap_ranges(stored, "2026-02-01", "2026-03-11") == [("2026-02-01", "2026-03-01")]
+    # a fully covered span has no gaps
+    assert gap_ranges(stored, "2026-03-01", "2026-03-11") == []
+    # a one-day silence is normal, not a gap
+    assert gap_ranges({"2026-01-01", "2026-01-03"}, "2026-01-01", "2026-01-04") == []
+    # a four-day silence is
+    assert gap_ranges({"2026-01-01", "2026-01-06"}, "2026-01-01", "2026-01-07") == [
+        ("2026-01-02", "2026-01-06")]
+    # min_gap_days is adjustable
+    assert gap_ranges({"2026-01-01", "2026-01-03"}, "2026-01-01", "2026-01-04",
+                      min_gap_days=1) == [("2026-01-02", "2026-01-03")]
+
+
+def test_gap_windows_skip_covered_months(tmp_path):
+    """The actual mistake this fixes: walking newest-first spent its windows
+    re-scanning months already captured, and never reached the missing ones."""
+    from xlikes.fetch import gap_windows
+
+    # every single day from 1 March onward is covered
+    day, have_march_onward = date(2026, 3, 1), set()
+    while day < date(2026, 9, 28):
+        have_march_onward.add(day.isoformat())
+        day += timedelta(days=1)
+    windows = gap_windows(have_march_onward, "2025-10-17", "2026-09-28", 5)
+    assert windows, "the pre-March span is missing and must be scanned"
+    # nothing inside the covered span is scheduled
+    assert all(end <= "2026-03-01" for _, end in windows)
+    # and the whole missing span is covered
+    assert min(s for s, _ in windows) == "2025-10-17"
+    assert max(e for _, e in windows) == "2026-03-01"
+
+
+def test_oldest_first_ordering_puts_the_missing_history_first():
+    from datetime import date
+    from xlikes.fetch import date_windows
+
+    windows = date_windows(date(2025, 10, 17), date(2026, 4, 1), 5)
+    assert windows[0][1] == "2026-04-01"            # newest-first by default
+    oldest_first = list(reversed(windows))
+    assert oldest_first[0][0] == "2025-10-17"       # what --order oldest does
+
+
+def test_fill_gaps_refuses_without_a_starting_point(tmp_path):
+    conn = db.connect(tmp_path / "empty.db")
+    conn.close()
+    result = _cli(tmp_path / "empty.db", "user", "nobody", "--mode", "search", "--fill-gaps")
+    assert result.returncode == 1
+    assert "no --since given" in result.stderr
