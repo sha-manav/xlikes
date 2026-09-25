@@ -205,6 +205,12 @@ histogram and lists months holding nothing, with the command to re-scan one.
 A quiet month and a missed month look the same in the data, so it names both
 and lets you judge.
 
+Every post is committed to SQLite as it arrives, not at the end of the walk, so
+a rate limit or a Ctrl-C keeps whatever was captured. Posts are keyed by id, so
+re-running resumes rather than duplicating — and when X throttles, the waits
+double (20s, 40s, 80s…) instead of hammering it, then move on to the next pass
+rather than hanging on one tab.
+
 Reposts only come from the timeline pass, and search does not return them, so
 `--mode search` alone will show fewer reposts than exist.
 

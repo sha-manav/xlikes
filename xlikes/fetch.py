@@ -299,7 +299,7 @@ def graphql_operation(url: str) -> str | None:
     return url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
 
 
-def collect_posts(payload, target: str, collected: dict, seen_handles: dict) -> int:
+def collect_posts(payload, target: str, collected: dict, seen_handles: dict) -> list[dict]:
     """Keep the target's posts from one payload; tally whose posts we skipped.
 
     Deliberately indifferent to which endpoint the payload came from: X renames
@@ -308,14 +308,14 @@ def collect_posts(payload, target: str, collected: dict, seen_handles: dict) -> 
     """
     from .parse import extract_timeline_posts
 
-    added = 0
+    added = []
     for rec in extract_timeline_posts(payload):
         handle = rec.get("handle") or "?"
         seen_handles[handle] = seen_handles.get(handle, 0) + 1
         if handle != target:
             continue
         if rec["id"] not in collected:
-            added += 1
+            added.append(rec)
         collected[rec["id"]] = rec  # last write wins: freshest counts
     return added
 
@@ -357,13 +357,14 @@ def no_posts_message(target, states, seen_handles, seen_ops, errors, debug_dir=N
 
 
 def _scroll_collect(page, count_fn, *, pause_ms=1500, max_stalls=6, verbose=False,
-                    label="", stop_fn=None, max_posts=None) -> int:
+                    label="", stop_fn=None, max_posts=None, max_rate_limits=5) -> dict:
     """Scroll until the page stops yielding new posts.
 
     A stall is only believed after trying to clear a rate-limit card, because
     throttling and the true end of a timeline look the same from here.
     """
-    stalls, previous = 0, count_fn()
+    limits: dict = {}
+    stalls, previous, gave_up = 0, count_fn(), False
     while stalls < max_stalls:
         if max_posts is not None and count_fn() >= max_posts:
             break
@@ -373,8 +374,17 @@ def _scroll_collect(page, count_fn, *, pause_ms=1500, max_stalls=6, verbose=Fals
         count = count_fn()
         if count == previous:
             stalls += 1
-            if _recover_if_stuck(page, verbose):
+            if _recover_if_stuck(page, verbose, limits):
                 stalls = max(0, stalls - 2)  # it was backpressure, not the end
+                if limits.get("hits", 0) >= max_rate_limits:
+                    # Still throttled after backing off repeatedly. Stop here so
+                    # the caller can move on with what it has, instead of
+                    # burning the remaining quota on this one tab.
+                    gave_up = True
+                    if verbose:
+                        print(f"\r  {label}still rate limited after "
+                              f"{limits['hits']} waits — moving on." + " " * 8)
+                    break
             else:
                 page.wait_for_timeout(pause_ms)
         else:
@@ -383,7 +393,40 @@ def _scroll_collect(page, count_fn, *, pause_ms=1500, max_stalls=6, verbose=Fals
                 print(f"\r  {label}{count} posts…", end="", flush=True)
         if stop_fn and stop_fn():
             break
-    return previous
+    return {"count": previous, "rate_limits": limits.get("hits", 0), "gave_up": gave_up}
+
+
+class Sink:
+    """Writes posts to SQLite as they arrive.
+
+    A long walk gets rate limited and interrupted often, and holding several
+    thousand posts in memory until the end means one Ctrl-C throws away
+    everything. Committing in batches makes every run resumable: posts are
+    keyed by id, so re-running picks up where it left off.
+    """
+
+    def __init__(self, conn, batch: int = 40):
+        self.conn = conn
+        self.batch = batch
+        self.stats = {"new": 0, "updated": 0, "unchanged": 0}
+        self._uncommitted = 0
+
+    def write(self, records) -> None:
+        for rec in records:
+            self.stats[db.upsert_post(self.conn, rec)] += 1
+            self._uncommitted += 1
+        if self._uncommitted >= self.batch:
+            self.commit()
+
+    def write_profile(self, profile: dict) -> None:
+        if profile.get("handle"):
+            db.upsert_account(self.conn, profile)
+            self.commit()
+
+    def commit(self) -> None:
+        if self._uncommitted or True:
+            self.conn.commit()
+            self._uncommitted = 0
 
 
 def capture_profile(payload, target: str, holder: dict) -> None:
@@ -432,6 +475,8 @@ def fetch_user_posts(
     seen_handles: dict[str, int] = {}
     seen_ops: dict[str, int] = {}
     errors: list[str] = []
+    sink = Sink(conn)
+    interrupted = False
     debug_dir = None
     if debug:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -448,8 +493,12 @@ def fetch_user_posts(
         except Exception as exc:
             errors.append(f"{operation}: unreadable response ({exc})")
             return
+        had_profile = bool(profile.get("statuses_count"))
         capture_profile(payload, target, profile)
+        if profile.get("statuses_count") and not had_profile:
+            sink.write_profile(profile)  # save the denominator before anything else
         added = collect_posts(payload, target, collected, seen_handles)
+        sink.write(added)
         if debug_dir and added:
             import json as _json
 
@@ -462,56 +511,65 @@ def fetch_user_posts(
         page.on("response", on_response)
         _wait_for_login(context, page)
 
-        states: list[str] = []
-        tabs = [("posts", f"https://x.com/{target}")]
-        if include_replies:
-            tabs.append(("replies", f"https://x.com/{target}/with_replies"))
+        try:
+            states: list[str] = []
+            tabs = [("posts", f"https://x.com/{target}")]
+            if include_replies:
+                tabs.append(("replies", f"https://x.com/{target}/with_replies"))
 
-        for label, url in tabs:
-            if verbose:
-                print(f"  {label}: {url}")
-            page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(3500)
+            for label, url in tabs:
+                if verbose:
+                    print(f"  {label}: {url}")
+                page.goto(url, wait_until="domcontentloaded")
+                page.wait_for_timeout(3500)
 
+                try:
+                    state = profile_state(page.inner_text("body", timeout=5000))
+                except Exception:
+                    state = "ok"
+                if state in ("missing", "suspended"):
+                    if debug_dir:
+                        page.screenshot(path=str(debug_dir / f"{label}.png"), full_page=False)
+                    context.close()
+                    raise FetchError(f"x.com/{target}: {PROFILE_DIAGNOSIS[state]}")
+                if state != "ok":
+                    states.append(state)
+
+                def past_cutoff():
+                    if not since:
+                        return False
+                    oldest = _oldest(collected)
+                    return bool(oldest and oldest < since)  # timeline is newest-first
+
+                _scroll_collect(
+                    page, lambda: len(collected), pause_ms=scroll_pause_ms,
+                    verbose=verbose, stop_fn=past_cutoff, max_posts=max_posts,
+                )
+                if verbose:
+                    print(f"\r  {label}: {len(collected)} total so far." + " " * 12)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n  interrupted — keeping the posts captured so far.")
+        if debug_dir and not interrupted:
             try:
-                state = profile_state(page.inner_text("body", timeout=5000))
+                page.screenshot(path=str(debug_dir / "final.png"), full_page=False)
             except Exception:
-                state = "ok"
-            if state in ("missing", "suspended"):
-                if debug_dir:
-                    page.screenshot(path=str(debug_dir / f"{label}.png"), full_page=False)
-                context.close()
-                raise FetchError(f"x.com/{target}: {PROFILE_DIAGNOSIS[state]}")
-            if state != "ok":
-                states.append(state)
-
-            def past_cutoff():
-                if not since:
-                    return False
-                oldest = _oldest(collected)
-                return bool(oldest and oldest < since)  # timeline is newest-first
-
-            _scroll_collect(
-                page, lambda: len(collected), pause_ms=scroll_pause_ms,
-                verbose=verbose, stop_fn=past_cutoff, max_posts=max_posts,
-            )
-            if verbose:
-                print(f"\r  {label}: {len(collected)} total so far." + " " * 12)
-        if debug_dir:
-            page.screenshot(path=str(debug_dir / "final.png"), full_page=False)
-        context.close()
+                pass
+        try:
+            context.close()
+        except Exception:
+            pass
 
     if not collected:
         raise FetchError(
             no_posts_message(target, states, seen_handles, seen_ops, errors, debug_dir)
         )
 
-    stats = {"new": 0, "updated": 0, "unchanged": 0}
-    for rec in collected.values():
-        stats[db.upsert_post(conn, rec)] += 1
-    if profile.get("handle"):
-        db.upsert_account(conn, profile)
-    conn.commit()
+    sink.write(list(collected.values()))  # refresh counts for repeat sightings
+    sink.write_profile(profile)
+    sink.commit()
+    stats = dict(sink.stats)
+    stats["interrupted"] = interrupted
     stats["profile"] = dict(profile)
     stats["total"] = len(collected)
     stats["skipped_other_authors"] = sum(
@@ -575,21 +633,30 @@ def split_window(start: str, end: str) -> list[tuple[str, str]]:
     return [(mid.isoformat(), end), (start, mid.isoformat())]
 
 
-def _recover_if_stuck(page, verbose: bool = False) -> bool:
+RATE_LIMIT_BASE_S = 20
+RATE_LIMIT_MAX_S = 240
+
+
+def _recover_if_stuck(page, verbose: bool = False, state: dict | None = None) -> bool:
     """X answers rate limits with an error card that mimics an empty timeline.
 
-    Clicking through it (or reloading) is the difference between stopping early
-    and continuing, so treat it as backpressure rather than the end of history.
+    Clicking through it is the difference between stopping early and carrying
+    on, so treat it as backpressure. Waits grow each time: repeated limits mean
+    X wants a longer pause, and retrying every 20s just burns the quota.
     """
+    state = state if state is not None else {}
     try:
         text = page.inner_text("body", timeout=3000).lower()
     except Exception:
         return False
     if "something went wrong" not in text and "try again" not in text:
         return False
+    state["hits"] = state.get("hits", 0) + 1
+    wait_s = min(RATE_LIMIT_BASE_S * 2 ** (state["hits"] - 1), RATE_LIMIT_MAX_S)
     if verbose:
-        print("\r  rate limited — backing off…", end="", flush=True)
-    page.wait_for_timeout(20000)
+        print(f"\r  rate limited ({state['hits']}) — waiting {wait_s}s…    ",
+              end="", flush=True)
+    page.wait_for_timeout(wait_s * 1000)
     for selector in ('div[role="button"]:has-text("Retry")', 'button:has-text("Retry")'):
         try:
             page.click(selector, timeout=2000)
@@ -641,6 +708,8 @@ def fetch_user_search(
     seen_handles: dict[str, int] = {}
     seen_ops: dict[str, int] = {}
     errors: list[str] = []
+    sink = Sink(conn)
+    interrupted = False
 
     def on_response(response):
         operation = graphql_operation(response.url)
@@ -652,8 +721,11 @@ def fetch_user_search(
         except Exception as exc:
             errors.append(f"{operation}: unreadable response ({exc})")
             return
+        had_profile = bool(profile.get("statuses_count"))
         capture_profile(payload, target, profile)
-        collect_posts(payload, target, collected, seen_handles)
+        if profile.get("statuses_count") and not had_profile:
+            sink.write_profile(profile)
+        sink.write(collect_posts(payload, target, collected, seen_handles))
 
     pending: list[tuple[str, str, bool]] = []  # (start, end, is_split)
     if not open_ended:
@@ -667,62 +739,68 @@ def fetch_user_search(
         page.on("response", on_response)
         _wait_for_login(context, page)
 
-        # Visit the profile first: its creation date bounds the walk, so an
-        # open-ended search stops at the account's first day instead of
-        # guessing from empty windows.
-        page.goto(f"https://x.com/{target}", wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-        floor = FLOOR
-        if profile.get("created_at"):
-            floor = max(FLOOR, date.fromisoformat(profile["created_at"][:10]))
-            if verbose:
-                print(f"  account created {floor.isoformat()} — walking back to there")
-        if since_date:
-            floor = max(floor, since_date)
-
-        while len(collected) < max_posts:
-            if not pending:
-                if not open_ended or cursor <= floor:
-                    break
-                start = max(floor, cursor - timedelta(days=window_days))
-                pending.append((start.isoformat(), cursor.isoformat(), False))
-                cursor = start
-
-            start, end, is_split = pending.pop(0)
-            before = len(collected)
-            page.goto(search_url(target, start, end, replies), wait_until="domcontentloaded")
+        try:
+            # Visit the profile first: its creation date bounds the walk, so an
+            # open-ended search stops at the account's first day instead of
+            # guessing from empty windows.
+            page.goto(f"https://x.com/{target}", wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
-            _scroll_collect(
-                page, lambda: len(collected), pause_ms=scroll_pause_ms,
-                verbose=False, max_posts=max_posts,
-            )
-            added = len(collected) - before
-            windows_done += 1
-            if verbose:
-                print(f"  {start} → {end}: +{added} (total {len(collected)})")
+            floor = FLOOR
+            if profile.get("created_at"):
+                floor = max(FLOOR, date.fromisoformat(profile["created_at"][:10]))
+                if verbose:
+                    print(f"  account created {floor.isoformat()} — walking back to there")
+            if since_date:
+                floor = max(floor, since_date)
 
-            # A full window was probably cut off; halve it and look again.
-            if added >= SPLIT_THRESHOLD:
-                halves = split_window(start, end)
-                if halves:
-                    splits += 1
-                    pending = [(s, e, True) for s, e in halves] + pending
+            while len(collected) < max_posts:
+                if not pending:
+                    if not open_ended or cursor <= floor:
+                        break
+                    start = max(floor, cursor - timedelta(days=window_days))
+                    pending.append((start.isoformat(), cursor.isoformat(), False))
+                    cursor = start
 
-            if not is_split:
-                empty_streak = empty_streak + 1 if added == 0 else 0
-                if open_ended and empty_streak >= max_empty_windows:
-                    if verbose:
-                        print(f"  {empty_streak} empty windows in a row — stopping.")
-                    break
-        context.close()
+                start, end, is_split = pending.pop(0)
+                before = len(collected)
+                page.goto(search_url(target, start, end, replies), wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+                _scroll_collect(
+                    page, lambda: len(collected), pause_ms=scroll_pause_ms,
+                    verbose=False, max_posts=max_posts,
+                )
+                added = len(collected) - before
+                windows_done += 1
+                if verbose:
+                    print(f"  {start} → {end}: +{added} (total {len(collected)})")
 
-    stats = {"new": 0, "updated": 0, "unchanged": 0}
-    for rec in collected.values():
-        stats[db.upsert_post(conn, rec)] += 1
-    if profile.get("handle"):
-        db.upsert_account(conn, profile)
-    conn.commit()
+                # A full window was probably cut off; halve it and look again.
+                if added >= SPLIT_THRESHOLD:
+                    halves = split_window(start, end)
+                    if halves:
+                        splits += 1
+                        pending = [(s, e, True) for s, e in halves] + pending
+
+                if not is_split:
+                    empty_streak = empty_streak + 1 if added == 0 else 0
+                    if open_ended and empty_streak >= max_empty_windows:
+                        if verbose:
+                            print(f"  {empty_streak} empty windows in a row — stopping.")
+                        break
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n  interrupted — keeping the posts captured so far.")
+        try:
+            context.close()
+        except Exception:
+            pass
+
+    sink.write(list(collected.values()))
+    sink.write_profile(profile)
+    sink.commit()
+    stats = dict(sink.stats)
     stats.update(
+        interrupted=interrupted,
         profile=dict(profile),
         total=len(collected),
         oldest=_oldest(collected),

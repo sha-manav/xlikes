@@ -163,13 +163,15 @@ def test_capture_does_not_depend_on_the_endpoint_name():
 
     collected, handles = {}, {}
     added = collect_posts(FIXTURE, TARGET, collected, handles)
-    assert added == 5 and len(collected) == 5
+    # returns the new records themselves, so callers can persist them at once
+    assert len(added) == 5 and len(collected) == 5
+    assert all(isinstance(r, dict) and r["handle"] == TARGET for r in added)
     assert handles["someoneelse"] == 1  # tallied, not stored
     assert TARGET not in [h for h in handles if h != TARGET] and handles[TARGET] == 5
     assert all(r["handle"] == TARGET for r in collected.values())
 
     # re-ingesting the same payload adds nothing new but refreshes in place
-    assert collect_posts(FIXTURE, TARGET, collected, handles) == 0
+    assert collect_posts(FIXTURE, TARGET, collected, handles) == []
 
     assert graphql_operation("https://x.com/i/api/graphql/abc/SomeRenamedOp?x=1") == "SomeRenamedOp"
     assert graphql_operation("https://x.com/home") is None
@@ -337,3 +339,53 @@ def test_account_upsert_keeps_fields_a_later_read_could_not_see(tmp_path):
     row = conn.execute("SELECT * FROM accounts WHERE handle='damnang2'").fetchone()
     assert row["statuses_count"] == 842 and row["name"] == "Dam Nang"
     assert row["created_at"] == "2025-10-15T08:12:00+00:00"
+
+
+def test_posts_are_persisted_as_they_arrive_not_at_the_end(tmp_path):
+    """A rate-limited walk gets interrupted; work already done must survive."""
+    from xlikes.fetch import Sink, collect_posts
+
+    conn = db.connect(tmp_path / "sink.db")
+    sink = Sink(conn, batch=2)
+    collected, handles = {}, {}
+
+    sink.write(collect_posts(FIXTURE, TARGET, collected, handles))
+    sink.commit()
+
+    # a *separate* connection sees them, i.e. they really are committed
+    other = db.connect(tmp_path / "sink.db")
+    assert other.execute("SELECT COUNT(*) c FROM posts").fetchone()["c"] == 5
+    assert sink.stats["new"] == 5
+
+    # re-running is resumable rather than duplicating
+    sink.write(collect_posts(FIXTURE, TARGET, {}, {}))
+    sink.commit()
+    assert other.execute("SELECT COUNT(*) c FROM posts").fetchone()["c"] == 5
+
+
+def test_rate_limit_backoff_grows(monkeypatch):
+    """Retrying every 20s burns quota; each limit should wait longer."""
+    from xlikes import fetch as fetch_mod
+
+    waits = []
+
+    class FakePage:
+        def inner_text(self, selector, timeout=0):
+            return "Something went wrong. Try reloading."
+
+        def wait_for_timeout(self, ms):
+            waits.append(ms // 1000)
+
+        def click(self, selector, timeout=0):
+            raise RuntimeError("no retry button")
+
+        def reload(self, wait_until=None):
+            pass
+
+    page, state = FakePage(), {}
+    for _ in range(5):
+        assert fetch_mod._recover_if_stuck(page, False, state)
+    backoffs = [w for w in waits if w >= fetch_mod.RATE_LIMIT_BASE_S]
+    assert backoffs == [20, 40, 80, 160, 240]      # doubling, then capped
+    assert max(backoffs) <= fetch_mod.RATE_LIMIT_MAX_S
+    assert state["hits"] == 5

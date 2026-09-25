@@ -223,7 +223,7 @@ def cmd_user(args, conn) -> int:
         profile_dir=args.profile,
         channel=None if args.browser == "chromium" else args.browser,
     )
-    ran, failures = [], []
+    ran, failures, stopped = [], [], False
 
     if args.mode in ("timeline", "both"):
         print("== profile timeline (fast; the only source of reposts) ==")
@@ -231,11 +231,15 @@ def cmd_user(args, conn) -> int:
             ran.append(("timeline", fetch_user_posts(
                 conn, handle=args.handle, max_posts=args.max, since=since,
                 include_replies=not args.no_replies, debug=args.debug, **shared)))
+            stopped = ran[-1][1].get("interrupted", False)
         except FetchError as exc:
             failures.append(str(exc))
             print(f"timeline: {exc}", file=sys.stderr)
 
-    if args.mode in ("search", "both"):
+    if stopped:
+        print("\nStopped at your request — skipping the search pass. "
+              "Everything captured is saved; re-run to carry on.")
+    if not stopped and args.mode in ("search", "both"):
         print("\n== dated search windows (reaches what the timeline won't serve) ==")
         try:
             stats = fetch_user_search(
@@ -260,6 +264,8 @@ def cmd_user(args, conn) -> int:
         extra = ""
         if label == "search":
             extra = f", {stats['windows']} windows, {stats['splits']} split"
+        if stats.get("interrupted"):
+            extra += " (interrupted, saved)"
         print(f"\n{label}: {stats['total']} captured — {stats['new']} new, "
               f"{stats['updated']} refreshed{extra}")
         if args.debug:
