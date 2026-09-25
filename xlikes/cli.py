@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -11,7 +12,8 @@ import textwrap
 from . import db, search as search_mod
 
 HI_ON, HI_OFF = "\x02", "\x03"
-COMMANDS = {"fetch", "search", "import-archive", "recent", "stats", "export"}
+COMMANDS = {"fetch", "search", "import-archive", "recent", "stats", "export",
+            "user", "user-export"}
 
 
 class Style:
@@ -200,6 +202,100 @@ def cmd_export(args, conn) -> int:
     return 0
 
 
+EXPORT_COLS = ("created_at kind handle author_name text likes views reposts replies "
+               "quotes bookmarks in_reply_to_handle in_reply_to_id quoted_handle quoted_id "
+               "quoted_text has_media lang urls url id").split()
+
+
+def cmd_user(args, conn) -> int:
+    from .fetch import FetchError, fetch_user_posts
+
+    try:
+        since = search_mod.parse_when(args.since)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        stats = fetch_user_posts(
+            conn,
+            handle=args.handle,
+            max_posts=args.max,
+            since=since,
+            include_replies=not args.no_replies,
+            headless=args.headless,
+            profile_dir=args.profile,
+            channel=None if args.browser == "chromium" else args.browser,
+        )
+    except FetchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"\n{stats['total']} posts stored — {stats['new']} new, {stats['updated']} refreshed.")
+    print(f"oldest reached: {(stats['oldest'] or 'unknown')[:10]}")
+    if stats["missing_views"]:
+        print(f"note: {stats['missing_views']} have no view count "
+              "(X only reports views for posts from late 2022 onward)")
+    if since and stats["oldest"] and stats["oldest"] > since:
+        print(f"note: didn't reach {since[:10]} — X stops serving a profile timeline "
+              "after roughly 3200 posts. Re-run to try for more.")
+    return 0
+
+
+def cmd_user_export(args, conn) -> int:
+    try:
+        since, until = search_mod.parse_when(args.since), search_mod.parse_when(args.until)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    where, params = ["handle = ?"], [args.handle.lstrip("@").lower()]
+    if since:
+        where.append("created_at >= ?")
+        params.append(since)
+    if until:
+        where.append("created_at <= ?")
+        params.append(until)
+    if args.kind != "all":
+        if args.kind == "posts":
+            where.append("kind IN ('post','quote','repost')")
+        elif args.kind == "replies":
+            where.append("kind = 'reply'")
+        else:
+            where.append("kind = ?")
+            params.append(args.kind)
+
+    rows = conn.execute(
+        f"SELECT * FROM posts WHERE {' AND '.join(where)} ORDER BY created_at DESC", params
+    ).fetchall()
+    if not rows:
+        total = conn.execute("SELECT COUNT(*) c FROM posts WHERE handle = ?",
+                             (args.handle.lstrip('@').lower(),)).fetchone()["c"]
+        if total:
+            print(f"No posts match those filters ({total} stored for "
+                  f"@{args.handle.lstrip('@')}).", file=sys.stderr)
+        else:
+            print(f"Nothing stored for @{args.handle.lstrip('@')} — run "
+                  f"`xlikes user {args.handle.lstrip('@')}` first.", file=sys.stderr)
+        return 1
+
+    stream = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+    try:
+        if args.format == "json":
+            json.dump([{c: r[c] for c in EXPORT_COLS} for r in rows], stream, indent=2)
+            stream.write("\n")
+        else:
+            writer = csv.writer(stream)
+            writer.writerow(EXPORT_COLS)
+            for row in rows:
+                writer.writerow(["" if row[c] is None else row[c] for c in EXPORT_COLS])
+    finally:
+        if args.out:
+            stream.close()
+            span = f"{rows[-1]['created_at'][:10]} → {rows[0]['created_at'][:10]}"
+            print(f"{len(rows)} rows ({span}) written to {args.out}", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xlikes",
@@ -252,6 +348,26 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("-n", "--limit", type=int, default=20)
     r.add_argument("--no-color", action="store_true")
     r.set_defaults(func=cmd_recent)
+
+    u = sub.add_parser("user", help="pull another account's posts and replies, with engagement counts")
+    u.add_argument("handle", help="the account to read, e.g. Damnang2")
+    u.add_argument("--since", help="stop scrolling once past this date: 3w, 2026-08-01")
+    u.add_argument("--max", type=int, default=2000, help="cap on posts (default 2000)")
+    u.add_argument("--no-replies", action="store_true", help="posts tab only, skip replies")
+    u.add_argument("--headless", action="store_true")
+    u.add_argument("--profile", help="browser profile dir")
+    u.add_argument("--browser", choices=["chromium", "chrome", "msedge"])
+    u.set_defaults(func=cmd_user)
+
+    ue = sub.add_parser("user-export", help="export a stored account's posts as CSV or JSON")
+    ue.add_argument("handle")
+    ue.add_argument("--since", help="only posts written after: 3w, 2026-08-01")
+    ue.add_argument("--until")
+    ue.add_argument("--kind", default="all",
+                    choices=["all", "posts", "replies", "post", "reply", "quote", "repost"])
+    ue.add_argument("--format", default="csv", choices=["csv", "json"])
+    ue.add_argument("--out", help="write to a file instead of stdout")
+    ue.set_defaults(func=cmd_user_export)
 
     sub.add_parser("stats", help="what's in the index").set_defaults(func=cmd_stats)
     sub.add_parser("export", help="dump the whole index as JSON").set_defaults(func=cmd_export)

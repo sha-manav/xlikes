@@ -134,6 +134,39 @@ xlikes stats            # what's in the index
 xlikes export > likes.json
 ```
 
+## Another account's posts and replies
+
+Separate from your likes: walk a profile's Posts and Replies tabs and record
+every post with its engagement counts.
+
+```bash
+xlikes user Damnang2 --since 2026-09-01
+xlikes user-export Damnang2 --since 2026-09-01 --out damnang2.csv
+```
+
+`user` scrolls both tabs and stops once the timeline passes `--since` (profile
+timelines are newest-first). `user-export` writes CSV (or `--format json`) with
+one row per post: date, kind, text, likes, views, reposts, replies, quotes,
+bookmarks, reply/quote context, and a permalink. Narrow with `--kind posts`,
+`--kind replies`, `--since` and `--until`.
+
+Posts by other accounts that appear as conversation context — the post being
+replied to, the original of a repost, a quoted post — are recorded as context
+but never attributed to the profile owner.
+
+Two limits worth knowing before you rely on a count of "every" post:
+
+- X stops serving a profile timeline after roughly **3200 posts**. Further back
+  than that isn't reachable this way, and `user` tells you the oldest date it
+  managed to reach.
+- **View counts only exist for posts from late 2022 onward**, and X sometimes
+  omits the number even when it exists. Those rows have an empty `views` cell,
+  which means "not reported" — not zero. Every count is also a snapshot from
+  when you fetched; re-running `user` refreshes them in place.
+
+Only public accounts work. A protected account is visible only to approved
+followers, and a suspended or renamed one won't load at all.
+
 ## Archive import (optional)
 
 X's official data export includes your complete like history, further back than

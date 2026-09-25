@@ -244,3 +244,129 @@ def extract_tweets(payload) -> list[dict]:
                 seen.add(rec["id"])
                 records.append(rec)
     return records
+
+
+# --- profile timelines: one account's own posts, with engagement counts ------
+
+
+def _int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def view_count(tweet: dict):
+    """Views, or None when X exposes no count.
+
+    Not every post has one: views only exist for posts from late 2022 onward,
+    and the payload can say views are enabled while omitting the number.
+    """
+    for source in (tweet.get("views") or {}, tweet.get("ext_views") or {}):
+        count = _int(source.get("count"))
+        if count is not None:
+            return count
+    return None
+
+
+def metrics(tweet: dict) -> dict:
+    legacy = tweet.get("legacy") or {}
+    return {
+        "likes": _int(legacy.get("favorite_count")),
+        "reposts": _int(legacy.get("retweet_count")),
+        "replies": _int(legacy.get("reply_count")),
+        "quotes": _int(legacy.get("quote_count")),
+        "bookmarks": _int(legacy.get("bookmark_count")),
+        "views": view_count(tweet),
+    }
+
+
+def post_kind(tweet: dict) -> str:
+    """Most specific label first: a repost of a reply is still a repost."""
+    legacy = tweet.get("legacy") or {}
+    if legacy.get("retweeted_status_result") or tweet.get("retweeted_status_result"):
+        return "repost"
+    if legacy.get("in_reply_to_status_id_str") or legacy.get("in_reply_to_screen_name"):
+        return "reply"
+    if tweet.get("quoted_status_result") or legacy.get("is_quote_status"):
+        return "quote"
+    return "post"
+
+
+def tweet_to_post(node: dict) -> dict | None:
+    """Flatten a tweet into a profile-timeline row with engagement counts."""
+    tweet = _unwrap(node)
+    if not tweet:
+        return None
+    tweet_id = tweet.get("rest_id") or (tweet.get("legacy") or {}).get("id_str")
+    if not tweet_id:
+        return None
+
+    legacy = tweet.get("legacy") or {}
+    handle, name = _user(tweet)
+    urls = _urls(tweet)
+    quoted = _unwrap((tweet.get("quoted_status_result") or {}).get("result"))
+    q_handle, _ = _user(quoted) if quoted else (None, None)
+    q_id = None
+    if quoted:
+        q_id = quoted.get("rest_id") or (quoted.get("legacy") or {}).get("id_str")
+
+    text = _full_text(tweet)
+    if title := _article_title(tweet):
+        text = "\n".join(p for p in (title, text) if p)
+
+    rec = {
+        "id": str(tweet_id),
+        "handle": handle.lower() if handle else None,
+        "author_name": name,
+        "created_at": parse_created_at(legacy.get("created_at")),
+        "kind": post_kind(tweet),
+        "text": text,
+        "url": f"https://x.com/{handle or 'i'}/status/{tweet_id}",
+        "in_reply_to_handle": legacy.get("in_reply_to_screen_name"),
+        "in_reply_to_id": legacy.get("in_reply_to_status_id_str"),
+        "conversation_id": legacy.get("conversation_id_str"),
+        "quoted_id": str(q_id) if q_id else legacy.get("quoted_status_id_str"),
+        "quoted_handle": q_handle,
+        "quoted_text": _full_text(quoted) if quoted else None,
+        "has_media": int(_has_media(tweet)),
+        "urls": "\n".join(urls),
+        "lang": legacy.get("lang"),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+    rec.update(metrics(tweet))
+    return rec
+
+
+def extract_timeline_posts(payload) -> list[dict]:
+    """Every post in a profile-timeline response, in document order.
+
+    Profile timelines nest tweets inside conversation modules, so unlike the
+    likes timeline there's no one entry shape to key off. We walk the whole
+    document but refuse to descend into quoted/reposted subtrees, so the
+    original of a repost is never mistaken for a post of its own.
+    """
+    found: list = []
+
+    def walk(node, in_nested=False):
+        if isinstance(node, dict):
+            if not in_nested and _is_tweet(node):
+                found.append(node)
+                for key, value in node.items():
+                    walk(value, True)  # anything under a tweet is context
+                return
+            for key, value in node.items():
+                walk(value, in_nested or key in NESTED_KEYS)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, in_nested)
+
+    walk(payload)
+
+    posts, seen = [], set()
+    for tweet in found:
+        rec = tweet_to_post(tweet)
+        if rec and rec["id"] not in seen:
+            seen.add(rec["id"])
+            posts.append(rec)
+    return posts

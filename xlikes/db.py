@@ -69,6 +69,37 @@ CREATE TRIGGER IF NOT EXISTS likes_au AFTER UPDATE ON likes BEGIN
 END;
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- Posts scraped from someone's profile timeline. Separate from `likes`: these
+-- are one account's own output, with engagement counts that change over time.
+CREATE TABLE IF NOT EXISTS posts (
+    id                 TEXT PRIMARY KEY,
+    handle             TEXT,        -- author, lowercased
+    author_name        TEXT,
+    created_at         TEXT,        -- ISO8601 UTC
+    kind               TEXT,        -- post | reply | quote | repost
+    text               TEXT,
+    url                TEXT,
+    in_reply_to_handle TEXT,
+    in_reply_to_id     TEXT,
+    conversation_id    TEXT,
+    quoted_id          TEXT,
+    quoted_handle      TEXT,
+    quoted_text        TEXT,
+    likes              INTEGER,
+    reposts            INTEGER,
+    replies            INTEGER,
+    quotes             INTEGER,
+    bookmarks          INTEGER,
+    views              INTEGER,     -- NULL when X exposes no count for the post
+    has_media          INTEGER DEFAULT 0,
+    urls               TEXT,
+    lang               TEXT,
+    fetched_at         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_handle  ON posts(handle, created_at);
+CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at);
 """
 
 # Columns a richer source is allowed to fill in over a sparser one.
@@ -152,3 +183,35 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
 def get_meta(conn: sqlite3.Connection, key: str, default=None):
     row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
+
+
+POST_COLS = (
+    "id handle author_name created_at kind text url in_reply_to_handle in_reply_to_id "
+    "conversation_id quoted_id quoted_handle quoted_text likes reposts replies quotes "
+    "bookmarks views has_media urls lang fetched_at"
+).split()
+
+# Engagement counts drift, so a re-fetch should refresh them rather than keep
+# the first numbers seen.
+_POST_REFRESH = "likes reposts replies quotes bookmarks views text fetched_at".split()
+
+
+def upsert_post(conn: sqlite3.Connection, rec: dict) -> str:
+    """Insert a post, refreshing engagement counts if we've seen it before."""
+    existing = conn.execute("SELECT id FROM posts WHERE id = ?", (rec["id"],)).fetchone()
+    values = [rec.get(c) for c in POST_COLS]
+    if existing is None:
+        conn.execute(
+            f"INSERT INTO posts ({','.join(POST_COLS)}) "
+            f"VALUES ({','.join('?' * len(POST_COLS))})",
+            values,
+        )
+        return "new"
+    updates = {c: rec.get(c) for c in _POST_REFRESH if rec.get(c) is not None}
+    if not updates:
+        return "unchanged"
+    conn.execute(
+        f"UPDATE posts SET {','.join(f'{k}=?' for k in updates)} WHERE id = ?",
+        [*updates.values(), rec["id"]],
+    )
+    return "updated"

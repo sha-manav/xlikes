@@ -245,3 +245,120 @@ def fetch_likes(
     conn.commit()
     stats["total"] = len(collected)
     return stats
+
+
+# --- profile timelines ------------------------------------------------------
+
+
+def is_user_timeline_response(url: str) -> bool:
+    """Is this the GraphQL call backing a profile's posts or replies tab?
+
+    Covers UserTweets, UserTweetsAndReplies and the UserWithProfileTweets…
+    variants, without matching Likes, HomeTimeline or search.
+    """
+    if "/graphql/" not in url:
+        return False
+    operation = url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1].lower()
+    return "user" in operation and "tweet" in operation
+
+
+def _oldest(records: dict) -> str | None:
+    dates = [r["created_at"] for r in records.values() if r.get("created_at")]
+    return min(dates) if dates else None
+
+
+def fetch_user_posts(
+    conn,
+    handle: str,
+    max_posts: int = 2000,
+    since: str | None = None,
+    include_replies: bool = True,
+    headless: bool = False,
+    profile_dir: Path | None = None,
+    channel: str | None = None,
+    scroll_pause_ms: int = 1500,
+    verbose: bool = True,
+) -> dict:
+    """Walk a profile's Posts and Replies tabs, recording engagement counts.
+
+    `since` (ISO8601) stops scrolling once the timeline passes it — profile
+    timelines are reverse-chronological, so there's no need to walk the rest.
+    """
+    from .parse import extract_timeline_posts
+
+    sync_playwright = _require_playwright()
+    profile_dir = Path(profile_dir or PROFILE_DIR)
+    target = handle.lstrip("@").lower()
+
+    collected: dict[str, dict] = {}
+    others = 0  # conversation context by other accounts, deliberately dropped
+    errors: list[str] = []
+
+    def on_response(response):
+        nonlocal others
+        if not is_user_timeline_response(response.url):
+            return
+        try:
+            payload = response.json()
+        except Exception as exc:
+            errors.append(f"unreadable response: {exc}")
+            return
+        for rec in extract_timeline_posts(payload):
+            if rec["handle"] != target:
+                others += 1
+                continue
+            collected[rec["id"]] = rec  # last write wins: freshest counts
+
+    with sync_playwright() as p:
+        context = _launch_any(p, profile_dir, headless, channel, verbose)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.on("response", on_response)
+        _wait_for_login(context, page)
+
+        tabs = [("posts", f"https://x.com/{target}")]
+        if include_replies:
+            tabs.append(("replies", f"https://x.com/{target}/with_replies"))
+
+        for label, url in tabs:
+            if verbose:
+                print(f"  {label}: {url}")
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_timeout(3500)
+
+            stalls, previous, stop = 0, len(collected), False
+            while len(collected) < max_posts and stalls < 6 and not stop:
+                page.keyboard.press("End")
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(scroll_pause_ms)
+                count = len(collected)
+                if count == previous:
+                    stalls += 1
+                    page.wait_for_timeout(scroll_pause_ms)
+                else:
+                    stalls, previous = 0, count
+                    if verbose:
+                        print(f"\r  {count} posts…", end="", flush=True)
+                if since and (oldest := _oldest(collected)) and oldest < since:
+                    stop = True  # timeline is newest-first; we're past the cutoff
+            if verbose:
+                print(f"\r  {label}: {len(collected)} total so far." + " " * 12)
+        context.close()
+
+    if not collected:
+        raise FetchError(
+            f"No posts captured from x.com/{target}.\n"
+            "  - Check the handle is spelled right.\n"
+            "  - A protected (locked) account is only visible to approved followers.\n"
+            "  - A suspended or renamed account won't load at all."
+            + (f"\nResponse errors: {errors[0]}" if errors else "")
+        )
+
+    stats = {"new": 0, "updated": 0, "unchanged": 0}
+    for rec in collected.values():
+        stats[db.upsert_post(conn, rec)] += 1
+    conn.commit()
+    stats["total"] = len(collected)
+    stats["skipped_other_authors"] = others
+    stats["oldest"] = _oldest(collected)
+    stats["missing_views"] = sum(1 for r in collected.values() if r.get("views") is None)
+    return stats
