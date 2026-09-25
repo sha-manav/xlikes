@@ -41,10 +41,17 @@ searching needs nothing but the standard library:
 python3 -m xlikes.cli search --quotes --articles --recent 200
 ```
 
-An alias saves the typing:
+Or put the bundled wrapper on your PATH once and forget about activation
+entirely — it finds the virtualenv itself, from any directory:
 
 ```bash
-echo "alias xlikes='$HOME/xlikes/.venv/bin/xlikes'" >> ~/.zshrc && source ~/.zshrc
+sudo ln -s ~/xlikes/bin/xlikes /usr/local/bin/xlikes
+```
+
+An alias works too:
+
+```bash
+echo "alias xlikes='$HOME/xlikes/bin/xlikes'" >> ~/.zshrc && source ~/.zshrc
 ```
 
 ## Pull your likes

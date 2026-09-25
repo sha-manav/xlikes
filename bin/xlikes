@@ -1,0 +1,13 @@
+#!/bin/sh
+# Run xlikes without activating the virtualenv first.
+#
+# Uses the repo's .venv if it exists, otherwise whatever python3 is on PATH —
+# searching needs nothing beyond the standard library, so the bare interpreter
+# is usually fine (only `fetch` and `user` need playwright). Works from any
+# directory; symlink it onto your PATH:
+#     ln -s "$PWD/bin/xlikes" /usr/local/bin/xlikes
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -x "$here/.venv/bin/python" ]; then
+    exec "$here/.venv/bin/python" -m xlikes.cli "$@"
+fi
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m xlikes.cli "$@"
