@@ -139,3 +139,68 @@ def test_csv_export_end_to_end(tmp_path):
 
     missing = _cli(tmp_path / "u.db", "user-export", "nobody")
     assert missing.returncode == 1 and "Nothing stored" in missing.stderr
+
+
+# --- diagnosing an empty result --------------------------------------------
+
+def test_profile_state_recognises_why_a_timeline_is_empty():
+    from xlikes.fetch import profile_state
+
+    assert profile_state("Home\nThis account doesn’t exist\nTry searching") == "missing"
+    assert profile_state("This account doesn't exist") == "missing"
+    assert profile_state("Account suspended\nX suspends accounts that violate") == "suspended"
+    assert profile_state("These posts are protected") == "protected"
+    assert profile_state("Caution: This account is temporarily restricted") == "restricted"
+    assert profile_state("Sign in to X\nSee what's happening") == "login_wall"
+    assert profile_state("Damnang2\n1,204 posts\nFollowing") == "ok"
+    assert profile_state("") == "ok"
+    assert profile_state(None) == "ok"
+
+
+def test_capture_does_not_depend_on_the_endpoint_name():
+    """X renames its GraphQL operations; author identity is the real test."""
+    from xlikes.fetch import collect_posts, graphql_operation
+
+    collected, handles = {}, {}
+    added = collect_posts(FIXTURE, TARGET, collected, handles)
+    assert added == 5 and len(collected) == 5
+    assert handles["someoneelse"] == 1  # tallied, not stored
+    assert TARGET not in [h for h in handles if h != TARGET] and handles[TARGET] == 5
+    assert all(r["handle"] == TARGET for r in collected.values())
+
+    # re-ingesting the same payload adds nothing new but refreshes in place
+    assert collect_posts(FIXTURE, TARGET, collected, handles) == 0
+
+    assert graphql_operation("https://x.com/i/api/graphql/abc/SomeRenamedOp?x=1") == "SomeRenamedOp"
+    assert graphql_operation("https://x.com/home") is None
+
+
+def test_wrong_handle_is_distinguishable_from_an_empty_profile():
+    from xlikes.fetch import collect_posts
+
+    collected, handles = {}, {}
+    collect_posts(FIXTURE, "notthisperson", collected, handles)
+    assert collected == {}
+    # the tally is what lets the error say "posts found, but none by @you"
+    assert sum(handles.values()) > 0 and "damnang2" in handles
+
+
+def test_empty_result_messages_name_the_actual_cause():
+    from xlikes.fetch import no_posts_message
+
+    # wrong handle: posts arrived, just not theirs
+    msg = no_posts_message("damnang2", [], {"someoneelse": 12, "damnang2": 0}, {"UserTweets": 2}, [])
+    assert "none by @damnang2" in msg and "@someoneelse (12)" in msg
+
+    # profile unreadable
+    msg = no_posts_message("damnang2", ["protected"], {}, {"UserTweets": 1}, [])
+    assert "only approved followers" in msg
+
+    # X answered but served no posts
+    msg = no_posts_message("damnang2", [], {}, {"UserTweets": 3, "UserByScreenName": 1}, [])
+    assert "no posts were in the response" in msg and "UserTweets x3" in msg
+
+    # nothing loaded at all
+    msg = no_posts_message("damnang2", [], {}, {}, ["boom"], debug_dir="/tmp/d")
+    assert "No GraphQL responses at all" in msg
+    assert "First response error: boom" in msg and "/tmp/d" in msg

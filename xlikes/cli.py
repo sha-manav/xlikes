@@ -96,6 +96,7 @@ def cmd_fetch(args, conn) -> int:
             headless=args.headless,
             profile_dir=args.profile,
             channel=None if args.browser == "chromium" else args.browser,
+            debug=args.debug,
         )
     except FetchError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -225,6 +226,7 @@ def cmd_user(args, conn) -> int:
             headless=args.headless,
             profile_dir=args.profile,
             channel=None if args.browser == "chromium" else args.browser,
+            debug=args.debug,
         )
     except FetchError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -235,6 +237,11 @@ def cmd_user(args, conn) -> int:
     if stats["missing_views"]:
         print(f"note: {stats['missing_views']} have no view count "
               "(X only reports views for posts from late 2022 onward)")
+    if args.debug:
+        ops = ", ".join(f"{op} x{n}" for op, n in sorted(stats["operations"].items()))
+        print(f"operations seen: {ops}")
+        print(f"other authors skipped: {stats['skipped_other_authors']}")
+        print(f"debug output: {stats['debug_dir']}")
     if since and stats["oldest"] and stats["oldest"] > since:
         print(f"note: didn't reach {since[:10]} — X stops serving a profile timeline "
               "after roughly 3200 posts. Re-run to try for more.")
@@ -357,6 +364,8 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--headless", action="store_true")
     u.add_argument("--profile", help="browser profile dir")
     u.add_argument("--browser", choices=["chromium", "chrome", "msedge"])
+    u.add_argument("--debug", action="store_true",
+                   help="save raw responses and a screenshot to ~/.xlikes/debug")
     u.set_defaults(func=cmd_user)
 
     ue = sub.add_parser("user-export", help="export a stored account's posts as CSV or JSON")

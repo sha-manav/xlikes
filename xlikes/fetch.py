@@ -262,6 +262,99 @@ def is_user_timeline_response(url: str) -> bool:
     return "user" in operation and "tweet" in operation
 
 
+# What x.com renders instead of a timeline. Checked as page text because these
+# states return HTTP 200 with no timeline request at all.
+PROFILE_MARKERS = (
+    ("missing", ("this account doesn\u2019t exist", "this account doesn't exist")),
+    ("suspended", ("account suspended", "this account is suspended")),
+    ("protected", ("these posts are protected", "this account's posts are protected")),
+    ("restricted", ("caution: this account is temporarily restricted",)),
+    ("login_wall", ("sign in to x", "don\u2019t miss what\u2019s happening")),
+)
+
+PROFILE_DIAGNOSIS = {
+    "missing": "That account doesn't exist — check the spelling, or it was renamed or deleted.",
+    "suspended": "That account is suspended, so X serves no posts for it.",
+    "protected": "That account is protected — only approved followers can read it.",
+    "restricted": "X has temporarily restricted that account, which hides the timeline.",
+    "login_wall": "X showed a logged-out page. The session may have expired; "
+                  "re-run and sign in when the window opens.",
+}
+
+
+def profile_state(page_text: str | None) -> str:
+    """Classify a profile page from its visible text: 'ok', or why it's empty."""
+    low = (page_text or "").lower()
+    for state, markers in PROFILE_MARKERS:
+        if any(marker in low for marker in markers):
+            return state
+    return "ok"
+
+
+def graphql_operation(url: str) -> str | None:
+    """The operation name from a GraphQL URL, for diagnostics."""
+    if "/graphql/" not in url:
+        return None
+    return url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+def collect_posts(payload, target: str, collected: dict, seen_handles: dict) -> int:
+    """Keep the target's posts from one payload; tally whose posts we skipped.
+
+    Deliberately indifferent to which endpoint the payload came from: X renames
+    its GraphQL operations, and a name-based filter silently captures nothing
+    when it guesses wrong. Author identity is the real test.
+    """
+    from .parse import extract_timeline_posts
+
+    added = 0
+    for rec in extract_timeline_posts(payload):
+        handle = rec.get("handle") or "?"
+        seen_handles[handle] = seen_handles.get(handle, 0) + 1
+        if handle != target:
+            continue
+        if rec["id"] not in collected:
+            added += 1
+        collected[rec["id"]] = rec  # last write wins: freshest counts
+    return added
+
+
+def no_posts_message(target, states, seen_handles, seen_ops, errors, debug_dir=None) -> str:
+    """Explain an empty result from what we actually observed.
+
+    The three cases look identical from the outside but need different fixes:
+    the profile can't be read, the handle is wrong, or the timeline never
+    loaded. Saying which one is the whole point of this message.
+    """
+    lines = [f"No posts captured from x.com/{target}."]
+    for state in dict.fromkeys(states or []):
+        lines.append(f"  {PROFILE_DIAGNOSIS[state]}")
+
+    others = {h: n for h, n in (seen_handles or {}).items() if h != target}
+    if others:
+        top = sorted(others.items(), key=lambda kv: -kv[1])[:6]
+        lines.append(
+            f"  Posts were found, but none by @{target}. Authors seen: "
+            + ", ".join(f"@{h} ({n})" for h, n in top)
+        )
+        lines.append("  If one of those is the account you meant, re-run with that handle.")
+    elif seen_ops:
+        lines.append(
+            "  X replied, but no posts were in the response. Operations seen: "
+            + ", ".join(f"{op} x{n}" for op, n in sorted(seen_ops.items())[:8])
+        )
+        lines.append("  Re-run with --debug to save the raw responses and a screenshot.")
+    else:
+        lines.append("  No GraphQL responses at all — the page never loaded a timeline.")
+        lines.append("  Re-run with --debug to save a screenshot of what the browser saw.")
+
+    if errors:
+        lines.append(f"  First response error: {errors[0]}")
+    if debug_dir:
+        lines.append(f"  Debug output: {debug_dir}")
+    return "\n".join(lines)
+
+
 def _oldest(records: dict) -> str | None:
     dates = [r["created_at"] for r in records.values() if r.get("created_at")]
     return min(dates) if dates else None
@@ -278,36 +371,43 @@ def fetch_user_posts(
     channel: str | None = None,
     scroll_pause_ms: int = 1500,
     verbose: bool = True,
+    debug: bool = False,
 ) -> dict:
     """Walk a profile's Posts and Replies tabs, recording engagement counts.
 
     `since` (ISO8601) stops scrolling once the timeline passes it — profile
     timelines are reverse-chronological, so there's no need to walk the rest.
     """
-    from .parse import extract_timeline_posts
-
     sync_playwright = _require_playwright()
     profile_dir = Path(profile_dir or PROFILE_DIR)
     target = handle.lstrip("@").lower()
 
     collected: dict[str, dict] = {}
-    others = 0  # conversation context by other accounts, deliberately dropped
+    seen_handles: dict[str, int] = {}
+    seen_ops: dict[str, int] = {}
     errors: list[str] = []
+    debug_dir = None
+    if debug:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        debug_dir = Path.home() / ".xlikes" / "debug" / f"{target}-{stamp}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
     def on_response(response):
-        nonlocal others
-        if not is_user_timeline_response(response.url):
+        operation = graphql_operation(response.url)
+        if operation is None:
             return
+        seen_ops[operation] = seen_ops.get(operation, 0) + 1
         try:
             payload = response.json()
         except Exception as exc:
-            errors.append(f"unreadable response: {exc}")
+            errors.append(f"{operation}: unreadable response ({exc})")
             return
-        for rec in extract_timeline_posts(payload):
-            if rec["handle"] != target:
-                others += 1
-                continue
-            collected[rec["id"]] = rec  # last write wins: freshest counts
+        added = collect_posts(payload, target, collected, seen_handles)
+        if debug_dir and added:
+            import json as _json
+
+            path = debug_dir / f"{operation}-{seen_ops[operation]}.json"
+            path.write_text(_json.dumps(payload, indent=1)[:4_000_000])
 
     with sync_playwright() as p:
         context = _launch_any(p, profile_dir, headless, channel, verbose)
@@ -315,6 +415,7 @@ def fetch_user_posts(
         page.on("response", on_response)
         _wait_for_login(context, page)
 
+        states: list[str] = []
         tabs = [("posts", f"https://x.com/{target}")]
         if include_replies:
             tabs.append(("replies", f"https://x.com/{target}/with_replies"))
@@ -324,6 +425,18 @@ def fetch_user_posts(
                 print(f"  {label}: {url}")
             page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(3500)
+
+            try:
+                state = profile_state(page.inner_text("body", timeout=5000))
+            except Exception:
+                state = "ok"
+            if state in ("missing", "suspended"):
+                if debug_dir:
+                    page.screenshot(path=str(debug_dir / f"{label}.png"), full_page=False)
+                context.close()
+                raise FetchError(f"x.com/{target}: {PROFILE_DIAGNOSIS[state]}")
+            if state != "ok":
+                states.append(state)
 
             stalls, previous, stop = 0, len(collected), False
             while len(collected) < max_posts and stalls < 6 and not stop:
@@ -342,15 +455,13 @@ def fetch_user_posts(
                     stop = True  # timeline is newest-first; we're past the cutoff
             if verbose:
                 print(f"\r  {label}: {len(collected)} total so far." + " " * 12)
+        if debug_dir:
+            page.screenshot(path=str(debug_dir / "final.png"), full_page=False)
         context.close()
 
     if not collected:
         raise FetchError(
-            f"No posts captured from x.com/{target}.\n"
-            "  - Check the handle is spelled right.\n"
-            "  - A protected (locked) account is only visible to approved followers.\n"
-            "  - A suspended or renamed account won't load at all."
-            + (f"\nResponse errors: {errors[0]}" if errors else "")
+            no_posts_message(target, states, seen_handles, seen_ops, errors, debug_dir)
         )
 
     stats = {"new": 0, "updated": 0, "unchanged": 0}
@@ -358,7 +469,11 @@ def fetch_user_posts(
         stats[db.upsert_post(conn, rec)] += 1
     conn.commit()
     stats["total"] = len(collected)
-    stats["skipped_other_authors"] = others
+    stats["skipped_other_authors"] = sum(
+        n for h, n in seen_handles.items() if h != target
+    )
     stats["oldest"] = _oldest(collected)
     stats["missing_views"] = sum(1 for r in collected.values() if r.get("views") is None)
+    stats["operations"] = seen_ops
+    stats["debug_dir"] = str(debug_dir) if debug_dir else None
     return stats
