@@ -263,7 +263,10 @@ def cmd_user(args, conn) -> int:
     for label, stats in ran:
         extra = ""
         if label == "search":
-            extra = f", {stats['windows']} windows, {stats['splits']} split"
+            extra = (f", {stats['windows']} windows"
+                     f" ({stats['continuations']} continued past a cut-off)")
+            if stats.get("truncated"):
+                extra += f", {len(stats['truncated'])} still short"
         if stats.get("interrupted"):
             extra += " (interrupted, saved)"
         print(f"\n{label}: {stats['total']} captured — {stats['new']} new, "

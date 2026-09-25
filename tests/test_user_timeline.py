@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -227,18 +228,6 @@ def test_date_windows_tile_without_gaps_or_overlap():
     assert date_windows(date(2026, 1, 1), date(2026, 1, 1), 14) == []
 
 
-def test_window_splitting_bottoms_out_at_a_day():
-    from xlikes.fetch import split_window
-
-    assert split_window("2026-01-01", "2026-01-03") == [("2026-01-02", "2026-01-03"),
-                                                        ("2026-01-01", "2026-01-02")]
-    halves = split_window("2026-01-01", "2026-02-01")
-    assert halves[0][1] == "2026-02-01" and halves[1][0] == "2026-01-01"
-    assert halves[0][0] == halves[1][1]        # still tiling
-    assert split_window("2026-01-01", "2026-01-02") == []   # can't split a single day
-    assert split_window("2026-01-01", "2026-01-01") == []
-
-
 def test_search_url_operators():
     from xlikes.fetch import search_url
 
@@ -389,3 +378,86 @@ def test_rate_limit_backoff_grows(monkeypatch):
     assert backoffs == [20, 40, 80, 160, 240]      # doubling, then capped
     assert max(backoffs) <= fetch_mod.RATE_LIMIT_MAX_S
     assert state["hits"] == 5
+
+
+# --- truncation detection ---------------------------------------------------
+
+def _posts_on(*days):
+    return {d: {"created_at": f"{d}T12:00:00+00:00"} for d in days}
+
+
+def test_window_coverage_is_the_oldest_post_inside_the_window():
+    from xlikes.fetch import window_coverage
+
+    collected = _posts_on("2026-03-18", "2026-03-20", "2026-03-25")
+    assert window_coverage(collected, "2026-03-17", "2026-03-22") == "2026-03-18"
+    # posts outside the window must not count towards its coverage
+    assert window_coverage(collected, "2026-03-23", "2026-03-27") == "2026-03-25"
+    assert window_coverage(collected, "2026-01-01", "2026-01-05") is None
+    assert window_coverage({}, "2026-03-17", "2026-03-22") is None
+
+
+def test_a_window_that_reached_its_start_needs_no_follow_up():
+    from xlikes.fetch import continuation_window
+
+    # oldest captured == window start: search got all the way back
+    assert continuation_window("2026-03-17", "2026-03-22", "2026-03-17", set()) is None
+    # nothing captured at all: an empty window, not a truncated one
+    assert continuation_window("2026-03-17", "2026-03-22", None, set()) is None
+
+
+def test_a_truncated_window_continues_from_where_it_stopped():
+    """The real bug: blind halving re-scanned ranges already covered, so the
+    halves reported +0 and told us nothing. Continue from the cut-off point."""
+    from xlikes.fetch import continuation_window
+
+    # search reached back only to the 20th of a 17th-22nd window
+    got = continuation_window("2026-03-17", "2026-03-22", "2026-03-20", set())
+    # the 20th is re-included, since it may only be partly captured
+    assert got == ("2026-03-17", "2026-03-21")
+    assert got[1] < "2026-03-22"          # strictly narrower than the parent
+    assert got[0] == "2026-03-17"         # still anchored at the unscanned start
+
+
+def test_continuation_never_repeats_a_window_or_loops():
+    from xlikes.fetch import continuation_window
+
+    # a window truncated on its very last day must not re-propose itself
+    got = continuation_window("2026-03-17", "2026-03-19", "2026-03-18", set())
+    assert got != ("2026-03-17", "2026-03-19")   # must not re-queue itself
+    assert got == ("2026-03-17", "2026-03-18")
+
+    # already-attempted ranges are not queued again
+    attempted = {("2026-03-17", "2026-03-21"), ("2026-03-17", "2026-03-20")}
+    assert continuation_window("2026-03-17", "2026-03-22", "2026-03-20", attempted) is None
+
+    # a single day that resists narrowing terminates instead of spinning
+    assert continuation_window("2026-03-17", "2026-03-18", "2026-03-17", set()) is None
+
+
+def test_continuation_terminates_when_walked_repeatedly():
+    """Drive the loop the way the fetcher does and prove it always halts."""
+    from xlikes.fetch import continuation_window
+
+    attempted = set()
+    start, end = "2026-03-01", "2026-04-01"
+    window = (start, end)
+    for _ in range(200):
+        attempted.add(window)
+        # worst case: each pass reaches back only one further day
+        covered = max(start, (date.fromisoformat(window[1]) - timedelta(days=1)).isoformat())
+        nxt = continuation_window(window[0], window[1], covered, attempted)
+        if nxt is None:
+            break
+        window = nxt
+    else:
+        raise AssertionError("continuation did not terminate")
+    assert window[0] == start
+
+
+def test_eta_is_omitted_when_meaningless():
+    from xlikes.fetch import _eta
+
+    assert _eta(0.0, 0, 10) == ""      # nothing done yet
+    assert _eta(0.0, 10, 10) == ""     # finished
+    assert _eta(0.0, 5, 0) == ""       # unknown total (open-ended walk)

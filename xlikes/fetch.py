@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -591,9 +592,6 @@ def fetch_user_posts(
 # reaches posts the timeline will never hand over.
 
 SEARCH_BASE = "https://x.com/search"
-# A window returning at least this many posts was probably truncated, so it
-# gets split and re-run rather than trusted.
-SPLIT_THRESHOLD = 120
 FLOOR = date(2006, 3, 21)  # X's first post; no point walking past it
 
 
@@ -624,13 +622,48 @@ def date_windows(since: date, until: date, days: int) -> list[tuple[str, str]]:
     return windows
 
 
-def split_window(start: str, end: str) -> list[tuple[str, str]]:
-    """Halve a window that looks truncated. Returns [] if it's already a day."""
-    start_d, end_d = date.fromisoformat(start), date.fromisoformat(end)
-    if (end_d - start_d).days <= 1:
-        return []
-    mid = start_d + (end_d - start_d) / 2
-    return [(mid.isoformat(), end), (start, mid.isoformat())]
+def _add_day(day: str) -> str:
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+
+
+def _eta(started: float, done: int, total: int) -> str:
+    """A rough finish estimate, because a silent 30-minute walk reads as hung."""
+    if not total or done < 1 or done >= total:
+        return ""
+    elapsed = time.monotonic() - started
+    remaining = elapsed / done * (total - done)
+    minutes = int(remaining // 60)
+    return f"  ~{minutes}m left" if minutes else f"  ~{int(remaining)}s left"
+
+
+def window_coverage(collected: dict, start: str, end: str) -> str | None:
+    """The oldest post captured inside [start, end), as a date, or None."""
+    days = [
+        rec["created_at"][:10]
+        for rec in collected.values()
+        if rec.get("created_at") and start <= rec["created_at"][:10] < end
+    ]
+    return min(days) if days else None
+
+
+def continuation_window(start: str, end: str, covered: str | None, attempted) -> tuple | None:
+    """The range a truncated window failed to reach, or None if it reached back.
+
+    Search returns newest-first and stops at its own limit, so the honest test
+    for truncation is whether the oldest post it returned reaches the window's
+    start — not how many posts came back. Counting results can't tell a full
+    window from a truncated one, and halving a window that was already complete
+    just re-scans ranges we have.
+    """
+    if covered is None or covered <= start:
+        return None
+    # Re-include the oldest day covered: it may be only partly captured.
+    candidate = (start, _add_day(covered))
+    if candidate == (start, end) or candidate in attempted:
+        candidate = (start, covered)  # that day resists narrowing; accept it
+    if candidate in attempted or candidate[0] >= candidate[1]:
+        return None
+    return candidate
 
 
 RATE_LIMIT_BASE_S = 20
@@ -727,11 +760,14 @@ def fetch_user_search(
             sink.write_profile(profile)
         sink.write(collect_posts(payload, target, collected, seen_handles))
 
-    pending: list[tuple[str, str, bool]] = []  # (start, end, is_split)
+    pending: list[tuple[str, str, bool]] = []  # (start, end, is_continuation)
     if not open_ended:
         pending = [(s, e, False) for s, e in date_windows(since_date, end_date, window_days)]
+    planned = len(pending) or None
+    attempted: set[tuple[str, str]] = set()
     cursor = end_date
-    windows_done, splits, empty_streak = 0, 0, 0
+    windows_done, extra, empty_streak, truncated = 0, 0, 0, []
+    started = time.monotonic()
 
     with sync_playwright() as p:
         context = _launch_any(p, profile_dir, headless, channel, verbose)
@@ -761,27 +797,40 @@ def fetch_user_search(
                     pending.append((start.isoformat(), cursor.isoformat(), False))
                     cursor = start
 
-                start, end, is_split = pending.pop(0)
+                start, end, is_continuation = pending.pop(0)
+                attempted.add((start, end))
                 before = len(collected)
+
+                position = (f"{windows_done + 1}/{planned + extra}" if planned
+                            else f"{windows_done + 1}")
+                label = f"[{position}] {start} → {end}  "
+                if verbose:
+                    print(f"  {label}loading…", end="\r", flush=True)
                 page.goto(search_url(target, start, end, replies), wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
                 _scroll_collect(
                     page, lambda: len(collected), pause_ms=scroll_pause_ms,
-                    verbose=False, max_posts=max_posts,
+                    verbose=verbose, label=label, max_posts=max_posts,
                 )
                 added = len(collected) - before
                 windows_done += 1
+
+                # Did this window reach its own start date, or stop short?
+                covered = window_coverage(collected, start, end)
+                follow_up = continuation_window(start, end, covered, attempted)
+                if follow_up:
+                    extra += 1
+                    pending.insert(0, (follow_up[0], follow_up[1], True))
+                elif covered and covered > start:
+                    truncated.append((start, end))
+
                 if verbose:
-                    print(f"  {start} → {end}: +{added} (total {len(collected)})")
+                    note = f" cut off at {covered}, continuing" if follow_up else ""
+                    print(f"  {label}+{added} (total {len(collected)}){note}"
+                          f"{_eta(started, windows_done, (planned or 0) + extra)}"
+                          + " " * 10)
 
-                # A full window was probably cut off; halve it and look again.
-                if added >= SPLIT_THRESHOLD:
-                    halves = split_window(start, end)
-                    if halves:
-                        splits += 1
-                        pending = [(s, e, True) for s, e in halves] + pending
-
-                if not is_split:
+                if not is_continuation:
                     empty_streak = empty_streak + 1 if added == 0 else 0
                     if open_ended and empty_streak >= max_empty_windows:
                         if verbose:
@@ -805,7 +854,8 @@ def fetch_user_search(
         total=len(collected),
         oldest=_oldest(collected),
         windows=windows_done,
-        splits=splits,
+        continuations=extra,
+        truncated=truncated,
         missing_views=sum(1 for r in collected.values() if r.get("views") is None),
         skipped_other_authors=sum(n for h, n in seen_handles.items() if h != target),
         operations=seen_ops,

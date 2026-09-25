@@ -175,9 +175,19 @@ So `user` runs two passes by default (`--mode both`):
    date ranges. Search is a separate index with a *per-query* limit, so short
    windows reach history the timeline will never hand over.
 
-Any window that comes back full is split in half and re-run, since a full
-window is indistinguishable from a truncated one. Without `--since` the walk
-keeps going back until it hits 8 consecutive empty windows.
+Each window reports how far back it actually reached. If search stopped before
+the window's start date, the unscanned remainder is queued immediately —
+continuing from the cut-off point rather than guessing from the number of
+results, which can't distinguish a full window from a truncated one. Without
+`--since` the walk keeps going back until it hits 8 consecutive empty windows.
+
+Progress shows the window number, running total and a rough ETA, since a long
+walk is otherwise indistinguishable from a hang:
+
+```
+  [7/34] 2026-03-07 → 2026-03-12  +102 (total 493)  ~19m left
+  [8/34] 2026-03-02 → 2026-03-07  +130 cut off at 2026-03-04, continuing  ~18m left
+```
 
 ```bash
 xlikes user Damnang2                            # both passes, walk back to the start
