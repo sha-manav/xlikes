@@ -190,3 +190,26 @@ def test_reports_the_true_match_count_when_truncating(tmp_path):
     assert count(conn) == 3
     assert count(conn, quotes_only=True) == 1
     assert count(conn, articles_only=True, recent=1) == 1
+
+
+def test_wrapper_script_works_through_a_symlink(tmp_path):
+    """The README tells people to symlink bin/xlikes onto their PATH, so $0 is
+    the symlink — resolving dirname($0) directly would point at /usr/local/bin
+    and never find the package."""
+    import os
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[1]
+    wrapper = repo / "bin" / "xlikes"
+    assert wrapper.exists() and os.access(wrapper, os.X_OK)
+
+    link = tmp_path / "xlikes"
+    link.symlink_to(wrapper)
+    chained = tmp_path / "xlikes-chained"
+    chained.symlink_to(link)
+
+    for entry in (wrapper, link, chained):
+        result = subprocess.run([str(entry), "--db", str(tmp_path / "w.db"), "stats"],
+                                capture_output=True, text=True, cwd="/")
+        assert result.returncode == 0, f"{entry}: {result.stderr}"
+        assert "likes indexed" in result.stdout
