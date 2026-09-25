@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from . import db
 from .parse import extract_tweets
@@ -355,6 +356,36 @@ def no_posts_message(target, states, seen_handles, seen_ops, errors, debug_dir=N
     return "\n".join(lines)
 
 
+def _scroll_collect(page, count_fn, *, pause_ms=1500, max_stalls=6, verbose=False,
+                    label="", stop_fn=None, max_posts=None) -> int:
+    """Scroll until the page stops yielding new posts.
+
+    A stall is only believed after trying to clear a rate-limit card, because
+    throttling and the true end of a timeline look the same from here.
+    """
+    stalls, previous = 0, count_fn()
+    while stalls < max_stalls:
+        if max_posts is not None and count_fn() >= max_posts:
+            break
+        page.keyboard.press("End")
+        page.mouse.wheel(0, 5000)
+        page.wait_for_timeout(pause_ms)
+        count = count_fn()
+        if count == previous:
+            stalls += 1
+            if _recover_if_stuck(page, verbose):
+                stalls = max(0, stalls - 2)  # it was backpressure, not the end
+            else:
+                page.wait_for_timeout(pause_ms)
+        else:
+            stalls, previous = 0, count
+            if verbose:
+                print(f"\r  {label}{count} posts…", end="", flush=True)
+        if stop_fn and stop_fn():
+            break
+    return previous
+
+
 def _oldest(records: dict) -> str | None:
     dates = [r["created_at"] for r in records.values() if r.get("created_at")]
     return min(dates) if dates else None
@@ -438,21 +469,16 @@ def fetch_user_posts(
             if state != "ok":
                 states.append(state)
 
-            stalls, previous, stop = 0, len(collected), False
-            while len(collected) < max_posts and stalls < 6 and not stop:
-                page.keyboard.press("End")
-                page.mouse.wheel(0, 5000)
-                page.wait_for_timeout(scroll_pause_ms)
-                count = len(collected)
-                if count == previous:
-                    stalls += 1
-                    page.wait_for_timeout(scroll_pause_ms)
-                else:
-                    stalls, previous = 0, count
-                    if verbose:
-                        print(f"\r  {count} posts…", end="", flush=True)
-                if since and (oldest := _oldest(collected)) and oldest < since:
-                    stop = True  # timeline is newest-first; we're past the cutoff
+            def past_cutoff():
+                if not since:
+                    return False
+                oldest = _oldest(collected)
+                return bool(oldest and oldest < since)  # timeline is newest-first
+
+            _scroll_collect(
+                page, lambda: len(collected), pause_ms=scroll_pause_ms,
+                verbose=verbose, stop_fn=past_cutoff, max_posts=max_posts,
+            )
             if verbose:
                 print(f"\r  {label}: {len(collected)} total so far." + " " * 12)
         if debug_dir:
@@ -476,4 +502,200 @@ def fetch_user_posts(
     stats["missing_views"] = sum(1 for r in collected.values() if r.get("views") is None)
     stats["operations"] = seen_ops
     stats["debug_dir"] = str(debug_dir) if debug_dir else None
+    return stats
+
+
+# --- exhaustive capture via dated search windows ----------------------------
+#
+# A profile timeline paginates to a cursor that dead-ends long before the full
+# history — X serves roughly 3200 posts and a rate-limited page looks exactly
+# like the end of the timeline. Search is a different index with its own
+# (per-query) limit, so slicing one account's history into short date windows
+# reaches posts the timeline will never hand over.
+
+SEARCH_BASE = "https://x.com/search"
+# A window returning at least this many posts was probably truncated, so it
+# gets split and re-run rather than trusted.
+SPLIT_THRESHOLD = 120
+FLOOR = date(2006, 3, 21)  # X's first post; no point walking past it
+
+
+def search_url(handle: str, start: str, end: str, replies: str = "include") -> str:
+    """Latest-tab search URL for one account over one date window.
+
+    `since:` is inclusive and `until:` exclusive, so consecutive windows tile
+    without overlapping or dropping a day. f=live is the Latest tab, which is
+    chronological and far more complete than Top.
+    """
+    query = f"from:{handle} since:{start} until:{end}"
+    if replies == "only":
+        query += " filter:replies"
+    elif replies == "exclude":
+        query += " -filter:replies"
+    return f"{SEARCH_BASE}?q={quote(query)}&src=typed_query&f=live"
+
+
+def date_windows(since: date, until: date, days: int) -> list[tuple[str, str]]:
+    """Tile [since, until) into newest-first windows of `days` each."""
+    if days < 1:
+        raise ValueError("window must be at least 1 day")
+    windows, end = [], until
+    while end > since:
+        start = max(since, end - timedelta(days=days))
+        windows.append((start.isoformat(), end.isoformat()))
+        end = start
+    return windows
+
+
+def split_window(start: str, end: str) -> list[tuple[str, str]]:
+    """Halve a window that looks truncated. Returns [] if it's already a day."""
+    start_d, end_d = date.fromisoformat(start), date.fromisoformat(end)
+    if (end_d - start_d).days <= 1:
+        return []
+    mid = start_d + (end_d - start_d) / 2
+    return [(mid.isoformat(), end), (start, mid.isoformat())]
+
+
+def _recover_if_stuck(page, verbose: bool = False) -> bool:
+    """X answers rate limits with an error card that mimics an empty timeline.
+
+    Clicking through it (or reloading) is the difference between stopping early
+    and continuing, so treat it as backpressure rather than the end of history.
+    """
+    try:
+        text = page.inner_text("body", timeout=3000).lower()
+    except Exception:
+        return False
+    if "something went wrong" not in text and "try again" not in text:
+        return False
+    if verbose:
+        print("\r  rate limited — backing off…", end="", flush=True)
+    page.wait_for_timeout(20000)
+    for selector in ('div[role="button"]:has-text("Retry")', 'button:has-text("Retry")'):
+        try:
+            page.click(selector, timeout=2000)
+            page.wait_for_timeout(3000)
+            return True
+        except Exception:
+            continue
+    try:
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_timeout(4000)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_user_search(
+    conn,
+    handle: str,
+    since: str | None = None,
+    until: str | None = None,
+    window_days: int = 14,
+    max_posts: int = 20000,
+    max_empty_windows: int = 8,
+    replies: str = "include",
+    headless: bool = False,
+    profile_dir: Path | None = None,
+    channel: str | None = None,
+    scroll_pause_ms: int = 1500,
+    verbose: bool = True,
+    debug: bool = False,
+) -> dict:
+    """Capture an account's posts by walking dated search windows.
+
+    Reaches history the profile timeline won't serve. Windows that come back
+    full are split and re-run, because a full window is indistinguishable from
+    a truncated one. Without `since` it walks backwards until it sees
+    `max_empty_windows` consecutive empty windows.
+    """
+    sync_playwright = _require_playwright()
+    profile_dir = Path(profile_dir or PROFILE_DIR)
+    target = handle.lstrip("@").lower()
+
+    end_date = date.fromisoformat(until[:10]) if until else date.today() + timedelta(days=1)
+    since_date = date.fromisoformat(since[:10]) if since else None
+    open_ended = since_date is None
+
+    collected: dict[str, dict] = {}
+    seen_handles: dict[str, int] = {}
+    seen_ops: dict[str, int] = {}
+    errors: list[str] = []
+
+    def on_response(response):
+        operation = graphql_operation(response.url)
+        if operation is None:
+            return
+        seen_ops[operation] = seen_ops.get(operation, 0) + 1
+        try:
+            payload = response.json()
+        except Exception as exc:
+            errors.append(f"{operation}: unreadable response ({exc})")
+            return
+        collect_posts(payload, target, collected, seen_handles)
+
+    pending: list[tuple[str, str, bool]] = []  # (start, end, is_split)
+    if not open_ended:
+        pending = [(s, e, False) for s, e in date_windows(since_date, end_date, window_days)]
+    cursor = end_date
+    windows_done, splits, empty_streak = 0, 0, 0
+
+    with sync_playwright() as p:
+        context = _launch_any(p, profile_dir, headless, channel, verbose)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.on("response", on_response)
+        _wait_for_login(context, page)
+
+        while len(collected) < max_posts:
+            if not pending:
+                if not open_ended or cursor <= FLOOR:
+                    break
+                start = max(FLOOR, cursor - timedelta(days=window_days))
+                pending.append((start.isoformat(), cursor.isoformat(), False))
+                cursor = start
+
+            start, end, is_split = pending.pop(0)
+            before = len(collected)
+            page.goto(search_url(target, start, end, replies), wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            _scroll_collect(
+                page, lambda: len(collected), pause_ms=scroll_pause_ms,
+                verbose=False, max_posts=max_posts,
+            )
+            added = len(collected) - before
+            windows_done += 1
+            if verbose:
+                print(f"  {start} → {end}: +{added} (total {len(collected)})")
+
+            # A full window was probably cut off; halve it and look again.
+            if added >= SPLIT_THRESHOLD:
+                halves = split_window(start, end)
+                if halves:
+                    splits += 1
+                    pending = [(s, e, True) for s, e in halves] + pending
+
+            if not is_split:
+                empty_streak = empty_streak + 1 if added == 0 else 0
+                if open_ended and empty_streak >= max_empty_windows:
+                    if verbose:
+                        print(f"  {empty_streak} empty windows in a row — stopping.")
+                    break
+        context.close()
+
+    stats = {"new": 0, "updated": 0, "unchanged": 0}
+    for rec in collected.values():
+        stats[db.upsert_post(conn, rec)] += 1
+    conn.commit()
+    stats.update(
+        total=len(collected),
+        oldest=_oldest(collected),
+        windows=windows_done,
+        splits=splits,
+        missing_views=sum(1 for r in collected.values() if r.get("views") is None),
+        skipped_other_authors=sum(n for h, n in seen_handles.items() if h != target),
+        operations=seen_ops,
+        debug_dir=None,
+    )
+    if not collected:
+        stats["error"] = no_posts_message(target, [], seen_handles, seen_ops, errors)
     return stats

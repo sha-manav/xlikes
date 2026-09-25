@@ -204,3 +204,72 @@ def test_empty_result_messages_name_the_actual_cause():
     msg = no_posts_message("damnang2", [], {}, {}, ["boom"], debug_dir="/tmp/d")
     assert "No GraphQL responses at all" in msg
     assert "First response error: boom" in msg and "/tmp/d" in msg
+
+
+# --- exhaustive capture via search windows ----------------------------------
+
+def test_date_windows_tile_without_gaps_or_overlap():
+    from datetime import date
+    from xlikes.fetch import date_windows
+
+    windows = date_windows(date(2026, 1, 1), date(2026, 3, 1), 14)
+    assert windows[0] == ("2026-02-15", "2026-03-01")   # newest first
+    assert windows[-1][0] == "2026-01-01"               # reaches the floor exactly
+    # `since:` is inclusive and `until:` exclusive, so each window's start is
+    # the previous one's end — no day is scanned twice or skipped
+    for newer, older in zip(windows, windows[1:]):
+        assert older[1] == newer[0]
+
+    # a range shorter than one window is still covered
+    assert date_windows(date(2026, 1, 1), date(2026, 1, 3), 14) == [("2026-01-01", "2026-01-03")]
+    assert date_windows(date(2026, 1, 1), date(2026, 1, 1), 14) == []
+
+
+def test_window_splitting_bottoms_out_at_a_day():
+    from xlikes.fetch import split_window
+
+    assert split_window("2026-01-01", "2026-01-03") == [("2026-01-02", "2026-01-03"),
+                                                        ("2026-01-01", "2026-01-02")]
+    halves = split_window("2026-01-01", "2026-02-01")
+    assert halves[0][1] == "2026-02-01" and halves[1][0] == "2026-01-01"
+    assert halves[0][0] == halves[1][1]        # still tiling
+    assert split_window("2026-01-01", "2026-01-02") == []   # can't split a single day
+    assert split_window("2026-01-01", "2026-01-01") == []
+
+
+def test_search_url_operators():
+    from xlikes.fetch import search_url
+
+    url = search_url("damnang2", "2026-09-01", "2026-09-15")
+    assert "from%3Adamnang2" in url and "since%3A2026-09-01" in url
+    assert "until%3A2026-09-15" in url
+    assert "f=live" in url            # Latest tab: chronological, most complete
+    assert "filter" not in url        # replies included by default
+    assert "-filter%3Areplies" in search_url("d", "2026-01-01", "2026-02-01", "exclude")
+    assert "filter%3Areplies" in search_url("d", "2026-01-01", "2026-02-01", "only")
+
+
+def test_invalid_window_is_rejected():
+    from datetime import date
+    import pytest as _pytest
+    from xlikes.fetch import date_windows
+
+    with _pytest.raises(ValueError):
+        date_windows(date(2026, 1, 1), date(2026, 2, 1), 0)
+
+
+def test_coverage_report_names_missing_months(tmp_path):
+    conn = db.connect(tmp_path / "c.db")
+    rows = list(mine().values())
+    for row in rows:
+        db.upsert_post(conn, row)
+    conn.commit()
+    conn.close()
+
+    result = _cli(tmp_path / "c.db", "user-coverage", "Damnang2")
+    assert result.returncode == 0, result.stderr
+    assert "2026-09" in result.stdout and "2019-03" in result.stdout
+    # the long silence between 2019 and 2026 must be reported, not glossed over
+    assert "month(s) with nothing stored" in result.stdout
+    assert "2019-04" in result.stdout
+    assert "--mode search --since 2019-04-01" in result.stdout

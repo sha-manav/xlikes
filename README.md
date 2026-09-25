@@ -161,11 +161,39 @@ Posts by other accounts that appear as conversation context — the post being
 replied to, the original of a repost, a quoted post — are recorded as context
 but never attributed to the profile owner.
 
-Two limits worth knowing before you rely on a count of "every" post:
+### Getting *all* the posts
 
-- X stops serving a profile timeline after roughly **3200 posts**. Further back
-  than that isn't reachable this way, and `user` tells you the oldest date it
-  managed to reach.
+Scrolling a profile hits a dead end long before the history runs out. X serves
+roughly 3200 posts per timeline, and a rate-limited page looks exactly like the
+end of one — which is why you can scroll to the bottom and still see reposts
+from years earlier.
+
+So `user` runs two passes by default (`--mode both`):
+
+1. **the profile timeline** — fast, and the only place reposts appear;
+2. **dated search windows** — `from:handle since:… until:…` over consecutive
+   date ranges. Search is a separate index with a *per-query* limit, so short
+   windows reach history the timeline will never hand over.
+
+Any window that comes back full is split in half and re-run, since a full
+window is indistinguishable from a truncated one. Without `--since` the walk
+keeps going back until it hits 8 consecutive empty windows.
+
+```bash
+xlikes user Damnang2                            # both passes, walk back to the start
+xlikes user Damnang2 --mode search --window 3   # narrower windows for a prolific account
+xlikes user-coverage Damnang2                   # posts per month, with gaps named
+```
+
+`user-coverage` is how you check rather than assume — it prints a per-month
+histogram and lists months holding nothing, with the command to re-scan one.
+A quiet month and a missed month look the same in the data, so it names both
+and lets you judge.
+
+Reposts only come from the timeline pass, and search does not return them, so
+`--mode search` alone will show fewer reposts than exist.
+
+Other limits worth knowing:
 - **View counts only exist for posts from late 2022 onward**, and X sometimes
   omits the number even when it exists. Those rows have an empty `views` cell,
   which means "not reported" — not zero. Every count is also a snapshot from

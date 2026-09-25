@@ -13,7 +13,7 @@ from . import db, search as search_mod
 
 HI_ON, HI_OFF = "\x02", "\x03"
 COMMANDS = {"fetch", "search", "import-archive", "recent", "stats", "export",
-            "user", "user-export"}
+            "user", "user-export", "user-coverage"}
 
 
 class Style:
@@ -209,42 +209,117 @@ EXPORT_COLS = ("created_at kind handle author_name text likes views reposts repl
 
 
 def cmd_user(args, conn) -> int:
-    from .fetch import FetchError, fetch_user_posts
+    from .fetch import FetchError, fetch_user_posts, fetch_user_search
 
     try:
         since = search_mod.parse_when(args.since)
+        until = search_mod.parse_when(args.until)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    try:
-        stats = fetch_user_posts(
-            conn,
-            handle=args.handle,
-            max_posts=args.max,
-            since=since,
-            include_replies=not args.no_replies,
-            headless=args.headless,
-            profile_dir=args.profile,
-            channel=None if args.browser == "chromium" else args.browser,
-            debug=args.debug,
-        )
-    except FetchError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+
+    shared = dict(
+        headless=args.headless,
+        profile_dir=args.profile,
+        channel=None if args.browser == "chromium" else args.browser,
+    )
+    ran, failures = [], []
+
+    if args.mode in ("timeline", "both"):
+        print("== profile timeline (fast; the only source of reposts) ==")
+        try:
+            ran.append(("timeline", fetch_user_posts(
+                conn, handle=args.handle, max_posts=args.max, since=since,
+                include_replies=not args.no_replies, debug=args.debug, **shared)))
+        except FetchError as exc:
+            failures.append(str(exc))
+            print(f"timeline: {exc}", file=sys.stderr)
+
+    if args.mode in ("search", "both"):
+        print("\n== dated search windows (reaches what the timeline won't serve) ==")
+        try:
+            stats = fetch_user_search(
+                conn, handle=args.handle, since=since, until=until,
+                window_days=args.window, max_posts=args.max,
+                max_empty_windows=args.max_empty,
+                replies="include" if not args.no_replies else "exclude",
+                debug=args.debug, **shared)
+            if stats.get("error") and not stats["total"]:
+                failures.append(stats["error"])
+                print(f"search: {stats['error']}", file=sys.stderr)
+            else:
+                ran.append(("search", stats))
+        except FetchError as exc:
+            failures.append(str(exc))
+            print(f"search: {exc}", file=sys.stderr)
+
+    if not ran:
         return 1
 
-    print(f"\n{stats['total']} posts stored — {stats['new']} new, {stats['updated']} refreshed.")
-    print(f"oldest reached: {(stats['oldest'] or 'unknown')[:10]}")
-    if stats["missing_views"]:
-        print(f"note: {stats['missing_views']} have no view count "
+    for label, stats in ran:
+        extra = ""
+        if label == "search":
+            extra = f", {stats['windows']} windows, {stats['splits']} split"
+        print(f"\n{label}: {stats['total']} captured — {stats['new']} new, "
+              f"{stats['updated']} refreshed{extra}")
+        if args.debug:
+            ops = ", ".join(f"{op} x{n}" for op, n in sorted(stats["operations"].items()))
+            print(f"  operations: {ops}")
+            print(f"  other authors skipped: {stats['skipped_other_authors']}")
+            if stats.get("debug_dir"):
+                print(f"  debug output: {stats['debug_dir']}")
+
+    handle = args.handle.lstrip("@").lower()
+    row = conn.execute(
+        "SELECT COUNT(*) n, MIN(created_at) oldest, MAX(created_at) newest, "
+        "SUM(views IS NULL) no_views FROM posts WHERE handle = ?", (handle,)).fetchone()
+    print(f"\nstored for @{handle}: {row['n']} posts, "
+          f"{(row['oldest'] or '?')[:10]} → {(row['newest'] or '?')[:10]}")
+    if row["no_views"]:
+        print(f"  {row['no_views']} have no view count "
               "(X only reports views for posts from late 2022 onward)")
-    if args.debug:
-        ops = ", ".join(f"{op} x{n}" for op, n in sorted(stats["operations"].items()))
-        print(f"operations seen: {ops}")
-        print(f"other authors skipped: {stats['skipped_other_authors']}")
-        print(f"debug output: {stats['debug_dir']}")
-    if since and stats["oldest"] and stats["oldest"] > since:
-        print(f"note: didn't reach {since[:10]} — X stops serving a profile timeline "
-              "after roughly 3200 posts. Re-run to try for more.")
+    print(f"  check for gaps with: xlikes user-coverage {handle}")
+    return 0
+
+
+def cmd_user_coverage(args, conn) -> int:
+    """Posts per month, so gaps in coverage are visible rather than assumed."""
+    handle = args.handle.lstrip("@").lower()
+    rows = conn.execute(
+        """SELECT substr(created_at,1,7) month, COUNT(*) n,
+                  SUM(kind='reply') replies, SUM(kind='repost') reposts
+           FROM posts WHERE handle = ? AND created_at IS NOT NULL
+           GROUP BY month ORDER BY month DESC""", (handle,)).fetchall()
+    if not rows:
+        print(f"Nothing stored for @{handle} — run `xlikes user {handle}` first.",
+              file=sys.stderr)
+        return 1
+
+    widest = max(r["n"] for r in rows)
+    print(f"{'month':8} {'posts':>6} {'repl':>5} {'rt':>4}")
+    months = {r["month"] for r in rows}
+    for row in rows:
+        bar = "█" * max(1, round(row["n"] / widest * 28))
+        print(f"{row['month']:8} {row['n']:>6} {row['replies'] or 0:>5} "
+              f"{row['reposts'] or 0:>4} {bar}")
+
+    # Name the calendar months with nothing at all — the likeliest gaps.
+    first, last = rows[-1]["month"], rows[0]["month"]
+    missing = []
+    year, month = int(first[:4]), int(first[5:7])
+    while f"{year:04d}-{month:02d}" <= last:
+        key = f"{year:04d}-{month:02d}"
+        if key not in months:
+            missing.append(key)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    print(f"\n{sum(r['n'] for r in rows)} posts across {len(months)} months "
+          f"({first} → {last})")
+    if missing:
+        print(f"{len(missing)} month(s) with nothing stored: {', '.join(missing[:14])}"
+              + (" …" if len(missing) > 14 else ""))
+        print("Those are either genuinely silent months or gaps. To re-check one:")
+        print(f"  xlikes user {handle} --mode search --since {missing[0]}-01 "
+              f"--until {missing[0]}-28 --window 7")
     return 0
 
 
@@ -358,8 +433,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     u = sub.add_parser("user", help="pull another account's posts and replies, with engagement counts")
     u.add_argument("handle", help="the account to read, e.g. Damnang2")
-    u.add_argument("--since", help="stop scrolling once past this date: 3w, 2026-08-01")
-    u.add_argument("--max", type=int, default=2000, help="cap on posts (default 2000)")
+    u.add_argument("--mode", default="both", choices=["timeline", "search", "both"],
+                   help="timeline = fast partial pass (and the only source of reposts); "
+                        "search = dated windows, reaches far more history; both (default)")
+    u.add_argument("--since", help="oldest date to reach: 3w, 2026-08-01 "
+                                   "(omitted: walk back until the account goes quiet)")
+    u.add_argument("--until", help="newest date to search (default today)")
+    u.add_argument("--window", type=int, default=14,
+                   help="days per search window (default 14; lower for prolific accounts)")
+    u.add_argument("--max-empty", type=int, default=8, dest="max_empty",
+                   help="consecutive empty windows before assuming the history ended")
+    u.add_argument("--max", type=int, default=20000, help="cap on posts (default 20000)")
     u.add_argument("--no-replies", action="store_true", help="posts tab only, skip replies")
     u.add_argument("--headless", action="store_true")
     u.add_argument("--profile", help="browser profile dir")
@@ -377,6 +461,10 @@ def build_parser() -> argparse.ArgumentParser:
     ue.add_argument("--format", default="csv", choices=["csv", "json"])
     ue.add_argument("--out", help="write to a file instead of stdout")
     ue.set_defaults(func=cmd_user_export)
+
+    uc = sub.add_parser("user-coverage", help="posts per month for a stored account, to spot gaps")
+    uc.add_argument("handle")
+    uc.set_defaults(func=cmd_user_coverage)
 
     sub.add_parser("stats", help="what's in the index").set_defaults(func=cmd_stats)
     sub.add_parser("export", help="dump the whole index as JSON").set_defaults(func=cmd_export)
