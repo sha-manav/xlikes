@@ -386,6 +386,20 @@ def _scroll_collect(page, count_fn, *, pause_ms=1500, max_stalls=6, verbose=Fals
     return previous
 
 
+def capture_profile(payload, target: str, holder: dict) -> None:
+    """Keep the richest profile read we see; only the profile response itself
+    carries statuses_count, while tweets embed a thinner copy of the author."""
+    from .parse import extract_user_profile
+
+    found = extract_user_profile(payload, target)
+    if not found:
+        return
+    if not holder or (found.get("statuses_count") is not None
+                      and holder.get("statuses_count") is None):
+        holder.clear()
+        holder.update(found)
+
+
 def _oldest(records: dict) -> str | None:
     dates = [r["created_at"] for r in records.values() if r.get("created_at")]
     return min(dates) if dates else None
@@ -414,6 +428,7 @@ def fetch_user_posts(
     target = handle.lstrip("@").lower()
 
     collected: dict[str, dict] = {}
+    profile: dict = {}
     seen_handles: dict[str, int] = {}
     seen_ops: dict[str, int] = {}
     errors: list[str] = []
@@ -433,6 +448,7 @@ def fetch_user_posts(
         except Exception as exc:
             errors.append(f"{operation}: unreadable response ({exc})")
             return
+        capture_profile(payload, target, profile)
         added = collect_posts(payload, target, collected, seen_handles)
         if debug_dir and added:
             import json as _json
@@ -493,7 +509,10 @@ def fetch_user_posts(
     stats = {"new": 0, "updated": 0, "unchanged": 0}
     for rec in collected.values():
         stats[db.upsert_post(conn, rec)] += 1
+    if profile.get("handle"):
+        db.upsert_account(conn, profile)
     conn.commit()
+    stats["profile"] = dict(profile)
     stats["total"] = len(collected)
     stats["skipped_other_authors"] = sum(
         n for h, n in seen_handles.items() if h != target
@@ -618,6 +637,7 @@ def fetch_user_search(
     open_ended = since_date is None
 
     collected: dict[str, dict] = {}
+    profile: dict = {}
     seen_handles: dict[str, int] = {}
     seen_ops: dict[str, int] = {}
     errors: list[str] = []
@@ -632,6 +652,7 @@ def fetch_user_search(
         except Exception as exc:
             errors.append(f"{operation}: unreadable response ({exc})")
             return
+        capture_profile(payload, target, profile)
         collect_posts(payload, target, collected, seen_handles)
 
     pending: list[tuple[str, str, bool]] = []  # (start, end, is_split)
@@ -646,11 +667,24 @@ def fetch_user_search(
         page.on("response", on_response)
         _wait_for_login(context, page)
 
+        # Visit the profile first: its creation date bounds the walk, so an
+        # open-ended search stops at the account's first day instead of
+        # guessing from empty windows.
+        page.goto(f"https://x.com/{target}", wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        floor = FLOOR
+        if profile.get("created_at"):
+            floor = max(FLOOR, date.fromisoformat(profile["created_at"][:10]))
+            if verbose:
+                print(f"  account created {floor.isoformat()} — walking back to there")
+        if since_date:
+            floor = max(floor, since_date)
+
         while len(collected) < max_posts:
             if not pending:
-                if not open_ended or cursor <= FLOOR:
+                if not open_ended or cursor <= floor:
                     break
-                start = max(FLOOR, cursor - timedelta(days=window_days))
+                start = max(floor, cursor - timedelta(days=window_days))
                 pending.append((start.isoformat(), cursor.isoformat(), False))
                 cursor = start
 
@@ -685,8 +719,11 @@ def fetch_user_search(
     stats = {"new": 0, "updated": 0, "unchanged": 0}
     for rec in collected.values():
         stats[db.upsert_post(conn, rec)] += 1
+    if profile.get("handle"):
+        db.upsert_account(conn, profile)
     conn.commit()
     stats.update(
+        profile=dict(profile),
         total=len(collected),
         oldest=_oldest(collected),
         windows=windows_done,

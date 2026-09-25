@@ -185,6 +185,21 @@ xlikes user Damnang2 --mode search --window 3   # narrower windows for a prolifi
 xlikes user-coverage Damnang2                   # posts per month, with gaps named
 ```
 
+Because the profile page reports its own post count and creation date, both are
+recorded and `user-coverage` measures against them:
+
+```
+account created: 2025-10-15
+stored 642 of the 712 posts the profile reports (90%)
+1 month(s) with nothing stored since account creation: 2026-02
+```
+
+That count includes replies and reposts and excludes deleted posts, so treat it
+as a ceiling rather than an exact target. Knowing the creation date also bounds
+the search walk — it stops at the account's first day instead of inferring the
+end from empty windows, and months before the account existed are never
+reported as gaps.
+
 `user-coverage` is how you check rather than assume — it prints a per-month
 histogram and lists months holding nothing, with the command to re-scan one.
 A quiet month and a missed month look the same in the data, so it names both

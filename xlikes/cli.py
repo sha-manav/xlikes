@@ -278,12 +278,21 @@ def cmd_user(args, conn) -> int:
     if row["no_views"]:
         print(f"  {row['no_views']} have no view count "
               "(X only reports views for posts from late 2022 onward)")
+    account = conn.execute(
+        "SELECT created_at, statuses_count FROM accounts WHERE handle = ?", (handle,)
+    ).fetchone()
+    if account and account["created_at"]:
+        print(f"  account created {account['created_at'][:10]}")
+    if account and account["statuses_count"]:
+        pct = round(row["n"] / account["statuses_count"] * 100)
+        print(f"  that's {pct}% of the {account['statuses_count']} posts the profile "
+              "reports (which includes replies and reposts, and excludes deletions)")
     print(f"  check for gaps with: xlikes user-coverage {handle}")
     return 0
 
 
 def cmd_user_coverage(args, conn) -> int:
-    """Posts per month, so gaps in coverage are visible rather than assumed."""
+    """Posts per month, measured against the profile's own post count."""
     handle = args.handle.lstrip("@").lower()
     rows = conn.execute(
         """SELECT substr(created_at,1,7) month, COUNT(*) n,
@@ -295,16 +304,44 @@ def cmd_user_coverage(args, conn) -> int:
               file=sys.stderr)
         return 1
 
+    account = conn.execute("SELECT * FROM accounts WHERE handle = ?", (handle,)).fetchone()
+    stored = sum(r["n"] for r in rows)
+
     widest = max(r["n"] for r in rows)
     print(f"{'month':8} {'posts':>6} {'repl':>5} {'rt':>4}")
     months = {r["month"] for r in rows}
     for row in rows:
-        bar = "█" * max(1, round(row["n"] / widest * 28))
+        bar = "\u2588" * max(1, round(row["n"] / widest * 28))
         print(f"{row['month']:8} {row['n']:>6} {row['replies'] or 0:>5} "
               f"{row['reposts'] or 0:>4} {bar}")
 
-    # Name the calendar months with nothing at all — the likeliest gaps.
-    first, last = rows[-1]["month"], rows[0]["month"]
+    print()
+    # Months before the account existed aren't gaps, so the window to check
+    # starts at whichever is later: account creation or the oldest post stored.
+    first = rows[-1]["month"]
+    created_month = None
+    if account and account["created_at"]:
+        created_month = account["created_at"][:7]
+        first = max(first, created_month) if created_month > first else first
+        first = created_month
+    last = rows[0]["month"]
+
+    if account and account["created_at"]:
+        print(f"account created: {account['created_at'][:10]}")
+    if account and account["statuses_count"]:
+        claimed = account["statuses_count"]
+        pct = round(stored / claimed * 100)
+        print(f"stored {stored} of the {claimed} posts the profile reports ({pct}%)")
+        if pct < 90:
+            print("  Under 90% — try narrower windows: "
+                  f"xlikes user {handle} --mode search --window 3")
+        print("  That figure counts posts, replies and reposts together and "
+              "excludes anything deleted, so it's a ceiling, not an exact target.")
+    else:
+        print(f"{stored} posts stored across {len(months)} months ({first} → {last})")
+        print(f"  No profile post count recorded yet — re-run `xlikes user {handle}` "
+              "to capture it and get a completeness figure.")
+
     missing = []
     year, month = int(first[:4]), int(first[5:7])
     while f"{year:04d}-{month:02d}" <= last:
@@ -312,14 +349,17 @@ def cmd_user_coverage(args, conn) -> int:
         if key not in months:
             missing.append(key)
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    print(f"\n{sum(r['n'] for r in rows)} posts across {len(months)} months "
-          f"({first} → {last})")
+
     if missing:
-        print(f"{len(missing)} month(s) with nothing stored: {', '.join(missing[:14])}"
-              + (" …" if len(missing) > 14 else ""))
-        print("Those are either genuinely silent months or gaps. To re-check one:")
+        print(f"\n{len(missing)} month(s) with nothing stored since "
+              f"{'account creation' if created_month else 'the oldest post'}: "
+              f"{', '.join(missing[:14])}" + (" \u2026" if len(missing) > 14 else ""))
+        print("A silent month and a missed month look identical here. To re-check one:")
         print(f"  xlikes user {handle} --mode search --since {missing[0]}-01 "
               f"--until {missing[0]}-28 --window 7")
+    else:
+        span = f"{first} \u2192 {last}"
+        print(f"\nEvery month from {span} has at least one post stored.")
     return 0
 
 

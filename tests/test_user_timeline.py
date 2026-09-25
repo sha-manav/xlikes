@@ -273,3 +273,67 @@ def test_coverage_report_names_missing_months(tmp_path):
     assert "month(s) with nothing stored" in result.stdout
     assert "2019-04" in result.stdout
     assert "--mode search --since 2019-04-01" in result.stdout
+
+
+# --- account profile: the denominator for completeness ----------------------
+
+PROFILE_FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures" / "user_profile.json").read_text()
+)
+
+
+def test_profile_is_read_from_the_account_response():
+    from xlikes.parse import extract_user_profile
+
+    got = extract_user_profile(PROFILE_FIXTURE, "Damnang2")
+    assert got["handle"] == "damnang2"
+    assert got["created_at"] == "2025-10-15T08:12:00+00:00"
+    assert got["statuses_count"] == 842
+    assert got["followers_count"] == 15300
+    assert got["protected"] == 0
+    assert extract_user_profile(PROFILE_FIXTURE, "someoneelse") is None
+
+
+def test_thin_author_copy_inside_tweets_does_not_overwrite_the_real_profile():
+    """Tweets embed an author object with no statuses_count; the profile
+    response is the only one that has it, and must win."""
+    from xlikes.fetch import capture_profile
+
+    holder = {}
+    capture_profile(FIXTURE, TARGET, holder)          # timeline first
+    assert holder["handle"] == TARGET
+    assert holder["statuses_count"] is None
+    capture_profile(PROFILE_FIXTURE, TARGET, holder)  # then the profile
+    assert holder["statuses_count"] == 842
+    capture_profile(FIXTURE, TARGET, holder)          # a later tweet must not clobber it
+    assert holder["statuses_count"] == 842
+
+
+def test_coverage_measures_against_the_profile_count(tmp_path):
+    from xlikes.parse import extract_user_profile
+
+    conn = db.connect(tmp_path / "cov.db")
+    for row in mine().values():
+        db.upsert_post(conn, row)
+    db.upsert_account(conn, extract_user_profile(PROFILE_FIXTURE, "Damnang2"))
+    conn.commit()
+    conn.close()
+
+    out = _cli(tmp_path / "cov.db", "user-coverage", "Damnang2")
+    assert out.returncode == 0, out.stderr
+    assert "account created: 2025-10-15" in out.stdout
+    assert "stored 5 of the 842 posts the profile reports (1%)" in out.stdout
+    assert "--window 3" in out.stdout  # under 90%, so it suggests narrowing
+    # months before the account existed are not gaps
+    assert "2019-04" not in out.stdout
+    assert "2025-11" in out.stdout     # but months since creation are
+
+
+def test_account_upsert_keeps_fields_a_later_read_could_not_see(tmp_path):
+    conn = db.connect(tmp_path / "a.db")
+    db.upsert_account(conn, {"handle": "damnang2", "statuses_count": 842,
+                             "created_at": "2025-10-15T08:12:00+00:00"})
+    db.upsert_account(conn, {"handle": "damnang2", "name": "Dam Nang"})
+    row = conn.execute("SELECT * FROM accounts WHERE handle='damnang2'").fetchone()
+    assert row["statuses_count"] == 842 and row["name"] == "Dam Nang"
+    assert row["created_at"] == "2025-10-15T08:12:00+00:00"

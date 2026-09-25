@@ -1,0 +1,25 @@
+{
+ "data": {
+  "user": {
+   "result": {
+    "__typename": "User",
+    "rest_id": "1975000000000000001",
+    "core": {
+     "screen_name": "Damnang2",
+     "name": "Dam Nang",
+     "created_at": "Wed Oct 15 08:12:00 +0000 2025"
+    },
+    "legacy": {
+     "screen_name": "Damnang2",
+     "name": "Dam Nang",
+     "created_at": "Wed Oct 15 08:12:00 +0000 2025",
+     "statuses_count": 842,
+     "followers_count": 15300,
+     "friends_count": 412,
+     "description": "posting through it",
+     "protected": false
+    }
+   }
+  }
+ }
+}

@@ -370,3 +370,57 @@ def extract_timeline_posts(payload) -> list[dict]:
             seen.add(rec["id"])
             posts.append(rec)
     return posts
+
+
+# --- account profile: the denominator for "did we get everything?" -----------
+
+
+def _profile_fields(user: dict) -> dict:
+    """Read profile fields from whichever shape X is serving.
+
+    Counts have stayed in `legacy`, while screen_name/name/created_at moved to
+    `core` on newer payloads, so both are checked.
+    """
+    core = user.get("core") or {}
+    legacy = user.get("legacy") or {}
+    handle = core.get("screen_name") or legacy.get("screen_name")
+    return {
+        "handle": handle.lower() if handle else None,
+        "name": core.get("name") or legacy.get("name"),
+        "created_at": parse_created_at(core.get("created_at") or legacy.get("created_at")),
+        # statuses_count counts posts, replies and reposts together, and drops
+        # anything deleted — a ceiling to compare against, not an exact target.
+        "statuses_count": _int(legacy.get("statuses_count")),
+        "followers_count": _int(legacy.get("followers_count")),
+        "following_count": _int(legacy.get("friends_count")),
+        "description": legacy.get("description"),
+        "protected": int(bool(legacy.get("protected"))),
+    }
+
+
+def extract_user_profile(payload, handle: str) -> dict | None:
+    """The profile object for `handle`, from any payload that embeds one."""
+    target = handle.lstrip("@").lower()
+    best = None
+
+    def walk(node):
+        nonlocal best
+        if isinstance(node, dict):
+            if node.get("__typename") == "User" or (
+                "rest_id" in node and "screen_name" in (node.get("legacy") or node.get("core") or {})
+            ):
+                fields = _profile_fields(node)
+                if fields["handle"] == target:
+                    # Tweets embed a thinner copy of their author; keep the
+                    # richest one, which is the profile response itself.
+                    if best is None or fields["statuses_count"] is not None:
+                        if best is None or best["statuses_count"] is None:
+                            best = fields
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return best

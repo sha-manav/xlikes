@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_DB = Path(os.environ.get("XLIKES_DB", Path.home() / ".xlikes" / "likes.db"))
@@ -96,6 +97,18 @@ CREATE TABLE IF NOT EXISTS posts (
     urls               TEXT,
     lang               TEXT,
     fetched_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    handle          TEXT PRIMARY KEY,
+    name            TEXT,
+    created_at      TEXT,        -- when the account was created
+    statuses_count  INTEGER,     -- posts+replies+reposts X claims, minus deletions
+    followers_count INTEGER,
+    following_count INTEGER,
+    description     TEXT,
+    protected       INTEGER,
+    fetched_at      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_handle  ON posts(handle, created_at);
@@ -215,3 +228,29 @@ def upsert_post(conn: sqlite3.Connection, rec: dict) -> str:
         [*updates.values(), rec["id"]],
     )
     return "updated"
+
+
+ACCOUNT_COLS = ("handle name created_at statuses_count followers_count "
+                "following_count description protected fetched_at").split()
+
+
+def upsert_account(conn: sqlite3.Connection, rec: dict) -> None:
+    """Record a profile, keeping any field the new read couldn't see."""
+    row = {c: rec.get(c) for c in ACCOUNT_COLS}
+    row["fetched_at"] = rec.get("fetched_at") or datetime.now(timezone.utc).isoformat()
+    existing = conn.execute(
+        "SELECT * FROM accounts WHERE handle = ?", (row["handle"],)
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            f"INSERT INTO accounts ({','.join(ACCOUNT_COLS)}) "
+            f"VALUES ({','.join('?' * len(ACCOUNT_COLS))})",
+            [row[c] for c in ACCOUNT_COLS],
+        )
+        return
+    updates = {c: v for c, v in row.items() if v is not None and c != "handle"}
+    if updates:
+        conn.execute(
+            f"UPDATE accounts SET {','.join(f'{k}=?' for k in updates)} WHERE handle = ?",
+            [*updates.values(), row["handle"]],
+        )
