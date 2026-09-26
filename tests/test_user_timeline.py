@@ -566,3 +566,37 @@ def test_rough_estimate_is_stated_for_long_runs_only():
     assert "m" in _rough_estimate(28)
     assert _rough_estimate(77).endswith("32m")
     assert "h" in _rough_estimate(700)              # a multi-hour job says so
+
+
+def test_gap_threshold_follows_the_accounts_posting_rhythm():
+    """Three days is a gap for someone posting daily and normal for someone
+    posting twice a week; a fixed threshold re-scans quiet stretches."""
+    from xlikes.fetch import suggest_min_gap
+
+    daily = {f"2026-03-{d:02d}" for d in range(1, 29)}
+    assert suggest_min_gap(daily) == 3
+
+    twice_weekly = {f"2026-0{m}-{d:02d}" for m in (3, 4)
+                    for d in (1, 5, 8, 12, 15, 19, 22, 26)}
+    assert 4 <= suggest_min_gap(twice_weekly) <= 6
+
+    # too little data to infer anything: stay at the sensitive default
+    assert suggest_min_gap({"2026-03-01", "2026-04-01"}) == 3
+    assert suggest_min_gap(set()) == 3
+
+    # a very sparse account is capped, because missing posts costs more than
+    # a few redundant windows
+    sparse = {"2026-03-01", "2026-03-20", "2026-04-14", "2026-05-02",
+              "2026-06-30", "2026-08-11", "2026-09-05"}
+    assert suggest_min_gap(sparse) == 14          # capped by the ceiling
+    # its median silence is 25 days, so a higher ceiling exposes that instead
+    assert suggest_min_gap(sparse, ceiling=30) == 26
+
+
+def test_a_sparse_account_still_gets_scanned():
+    from xlikes.fetch import gap_windows, suggest_min_gap
+
+    sparse = {"2026-03-01", "2026-03-20", "2026-04-14", "2026-05-02"}
+    windows = gap_windows(sparse, "2026-03-01", "2026-05-10", 5,
+                          suggest_min_gap(sparse))
+    assert windows, "long silences must still be searched, not assumed quiet"

@@ -238,9 +238,12 @@ xlikes user Damnang2 --mode search --fill-gaps --window 5
 It loads the profile first to learn when the account was created, then searches
 the runs of days with no posts between that day and today. The account's first
 day is the anchor deliberately: anchoring on the oldest post already stored
-would hide everything older than it, which is usually the entire gap. Silences
-shorter than `--min-gap` days (3 by default) are treated as a quiet stretch
-rather than a gap, since no account posts every single day.
+would hide everything older than it, which is usually the entire gap. Silences shorter than `--min-gap` are treated as a quiet stretch rather than a
+gap, since no account posts every single day. Left unset, the threshold comes
+from the account's own rhythm — a little longer than its median silence — because
+three days is a gap for someone posting daily and normal for someone posting
+twice a week. It is deliberately biased towards scanning: a threshold set too
+low costs a few redundant windows, one set too high misses posts.
 
 `user-coverage` is how you check rather than assume — it prints a per-month
 histogram and lists months holding nothing, with the command to re-scan one.

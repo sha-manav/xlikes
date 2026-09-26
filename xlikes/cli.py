@@ -257,8 +257,9 @@ def cmd_user(args, conn) -> int:
                 debug=args.debug, **shared)
             if stats.get("examined") and not stats["windows"]:
                 a, b = stats["examined"]
+                gap = stats.get("min_gap_days") or args.min_gap
                 print(f"\n{a} → {b} is already covered — no blanks of "
-                      f"{args.min_gap}+ days to search.")
+                      f"{gap}+ days to search.")
                 return 0
             if stats.get("error") and not stats["total"]:
                 failures.append(stats["error"])
@@ -511,8 +512,9 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--fill-gaps", action="store_true",
                    help="only search date ranges with no posts stored, oldest first — "
                         "skips months you already have")
-    u.add_argument("--min-gap", type=int, default=3, metavar="DAYS",
-                   help="with --fill-gaps, ignore silences shorter than this (default 3)")
+    u.add_argument("--min-gap", type=int, metavar="DAYS",
+                   help="with --fill-gaps, ignore silences shorter than this "
+                        "(default: inferred from how often the account posts)")
     u.add_argument("--order", choices=["newest", "oldest"],
                    help="which end of the range to search first "
                         "(default: newest, or oldest with --fill-gaps)")

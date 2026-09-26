@@ -727,7 +727,7 @@ def fetch_user_search(
     windows: list | None = None,
     order: str = "newest",
     fill_gaps: bool = False,
-    min_gap_days: int = 3,
+    min_gap_days: int | None = None,
     headless: bool = False,
     profile_dir: Path | None = None,
     channel: str | None = None,
@@ -792,7 +792,7 @@ def fetch_user_search(
     attempted: set[tuple[str, str]] = set()
     cursor = end_date
     windows_done, extra, empty_streak, truncated = 0, 0, 0, []
-    examined, budget_hit = None, False
+    examined, budget_hit, effective_min_gap = None, False, min_gap_days
     started = time.monotonic()
 
     with sync_playwright() as p:
@@ -834,9 +834,11 @@ def fetch_user_search(
                 gap_end = (until or "")[:10] or (date.today() + timedelta(days=1)).isoformat()
                 span = (date.fromisoformat(gap_end) - date.fromisoformat(gap_start)).days
                 chosen = window_days or auto_window_days(span)
-                plan = gap_windows(stored_days, gap_start, gap_end, chosen, min_gap_days)
+                min_gap = min_gap_days or suggest_min_gap(stored_days)
+                plan = gap_windows(stored_days, gap_start, gap_end, chosen, min_gap)
                 examined = (gap_start, gap_end)
                 effective_window = chosen
+                effective_min_gap = min_gap
                 pending = [(w_start, w_end, False) for w_start, w_end in plan]
                 if order == "oldest":
                     pending.reverse()
@@ -847,9 +849,12 @@ def fetch_user_search(
                         print(f"  {len(pending)} window(s) of {chosen} days with no "
                               f"posts stored between {gap_start} and {gap_end}"
                               f"{_rough_estimate(len(pending))}")
+                        if not min_gap_days:
+                            print(f"  (a blank counts as a gap at {min_gap}+ days, "
+                                  "from this account's own posting rhythm)")
                     else:
                         print(f"  {gap_start} \u2192 {gap_end} is already covered "
-                              f"(no blanks of {min_gap_days}+ days)")
+                              f"(no blanks of {min_gap}+ days)")
 
             while len(collected) < max_posts:
                 if time_budget_s and time.monotonic() - started > time_budget_s:
@@ -927,6 +932,7 @@ def fetch_user_search(
         examined=examined,
         budget_hit=budget_hit,
         window_days=effective_window,
+        min_gap_days=effective_min_gap,
         remaining=len(pending),
         elapsed_s=round(time.monotonic() - started),
         missing_views=sum(1 for r in collected.values() if r.get("views") is None),
@@ -965,6 +971,26 @@ def gap_anchor(since: str | None, profile_created_at: str | None, stored_days: s
         if candidate:
             return candidate[:10]
     return min(stored_days) if stored_days else None
+
+
+def suggest_min_gap(stored_days: set, floor: int = 3, ceiling: int = 14) -> int:
+    """How long a silence has to be, for this account, to look like a gap.
+
+    A fixed three days suits someone posting daily and is nonsense for someone
+    posting twice a week — it turns every ordinary quiet stretch into a window
+    to re-scan. So it comes from the account's own rhythm: a little longer than
+    its typical silence.
+
+    Biased towards scanning: the median rather than a high percentile, and a
+    hard ceiling, because the cost of a threshold set too low is a few redundant
+    windows, while the cost of one set too high is missing posts.
+    """
+    days = sorted(date.fromisoformat(d) for d in stored_days)
+    if len(days) < 6:
+        return floor  # too little to infer a rhythm from
+    silences = sorted((b - a).days for a, b in zip(days, days[1:]))
+    median = silences[len(silences) // 2]
+    return max(floor, min(ceiling, median + 1))
 
 
 def gap_ranges(stored_days: set, start: str, end: str, min_gap_days: int = 3) -> list:
