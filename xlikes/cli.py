@@ -253,6 +253,7 @@ def cmd_user(args, conn) -> int:
                 max_empty_windows=args.max_empty,
                 replies="include" if not args.no_replies else "exclude",
                 order=order, fill_gaps=args.fill_gaps, min_gap_days=args.min_gap,
+                time_budget_s=args.minutes * 60 if args.minutes else None,
                 debug=args.debug, **shared)
             if stats.get("examined") and not stats["windows"]:
                 a, b = stats["examined"]
@@ -274,10 +275,14 @@ def cmd_user(args, conn) -> int:
     for label, stats in ran:
         extra = ""
         if label == "search":
-            extra = (f", {stats['windows']} windows"
+            extra = (f", {stats['windows']} windows of {stats['window_days']}d"
                      f" ({stats['continuations']} continued past a cut-off)")
             if stats.get("truncated"):
                 extra += f", {len(stats['truncated'])} still short"
+            if stats.get("budget_hit"):
+                extra += (f"\n  stopped on your time budget with "
+                          f"{stats['remaining']} window(s) left — re-run the same "
+                          "command to carry on")
         if stats.get("interrupted"):
             extra += " (interrupted, saved)"
         print(f"\n{label}: {stats['total']} captured — {stats['new']} new, "
@@ -499,8 +504,10 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--since", help="oldest date to reach: 3w, 2026-08-01 "
                                    "(omitted: walk back until the account goes quiet)")
     u.add_argument("--until", help="newest date to search (default today)")
-    u.add_argument("--window", type=int, default=14,
-                   help="days per search window (default 14; lower for prolific accounts)")
+    u.add_argument("--window", type=int,
+                   help="days per search window (default: sized from the span — "
+                        "coarse for a long history, since truncated windows narrow "
+                        "themselves)")
     u.add_argument("--fill-gaps", action="store_true",
                    help="only search date ranges with no posts stored, oldest first — "
                         "skips months you already have")
@@ -509,6 +516,9 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--order", choices=["newest", "oldest"],
                    help="which end of the range to search first "
                         "(default: newest, or oldest with --fill-gaps)")
+    u.add_argument("--for", type=float, dest="minutes", metavar="MINUTES",
+                   help="stop after roughly this long and report what's left; "
+                        "re-run with --fill-gaps to carry on")
     u.add_argument("--max-empty", type=int, default=8, dest="max_empty",
                    help="consecutive empty windows before assuming the history ended")
     u.add_argument("--max", type=int, default=20000, help="cap on posts (default 20000)")

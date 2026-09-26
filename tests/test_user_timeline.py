@@ -533,3 +533,36 @@ def test_gap_filling_anchors_on_the_accounts_first_day():
     assert anchored and min(s for s, _ in anchored) == "2025-10-17"
     # anchored on stored data: nothing to do, which is the wrong answer
     assert gap_windows(stored, gap_anchor(None, None, stored), "2026-03-29", 5) == []
+
+
+# --- scaling to a long history ----------------------------------------------
+
+def test_window_size_adapts_to_the_span():
+    """Five-day windows over a nine-year account is ~700 page loads, most of
+    them over quiet stretches. Start coarse; truncation narrows what it must."""
+    from xlikes.fetch import auto_window_days, date_windows
+
+    nine_years = auto_window_days(3500)
+    assert nine_years == 45
+    assert len(date_windows(date(2017, 2, 1), date(2026, 9, 26), nine_years)) < 90
+
+    # a short span still gets fine-grained windows
+    assert auto_window_days(140) == 5
+    assert auto_window_days(30) == 5
+    assert auto_window_days(0) == 5          # degenerate span
+    assert auto_window_days(-10) == 5
+    # never coarser than 45 days, however long the history
+    assert auto_window_days(100_000) == 45
+    # and monotonic in span
+    spans = [30, 140, 365, 1000, 3500, 10000]
+    sizes = [auto_window_days(x) for x in spans]
+    assert sizes == sorted(sizes)
+
+
+def test_rough_estimate_is_stated_for_long_runs_only():
+    from xlikes.fetch import _rough_estimate
+
+    assert _rough_estimate(2) == ""                 # trivially short, no noise
+    assert "m" in _rough_estimate(28)
+    assert _rough_estimate(77).endswith("32m")
+    assert "h" in _rough_estimate(700)              # a multi-hour job says so

@@ -191,9 +191,23 @@ walk is otherwise indistinguishable from a hang:
 
 ```bash
 xlikes user Damnang2                            # both passes, walk back to the start
-xlikes user Damnang2 --mode search --window 3   # narrower windows for a prolific account
 xlikes user-coverage Damnang2                   # posts per month, with gaps named
 ```
+
+Window size is chosen from the span unless you pass `--window`: coarse for a
+long history, fine for a short one. Starting coarse is safe because a truncated
+window continues from its own cut-off, so narrowing happens only where the
+posting volume demands it — a nine-year account is ~77 windows rather than ~700.
+
+A long history takes a while, so a run can be bounded and resumed:
+
+```bash
+xlikes user Teo_Sinamin --mode search --fill-gaps --for 45
+```
+
+It stops after about 45 minutes, reports how many windows are left, and the same
+command picks up where it stopped — gaps are recomputed from what's stored, so
+nothing is re-scanned.
 
 Because the profile page reports its own post count and creation date, both are
 recorded and `user-coverage` measures against them:

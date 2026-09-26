@@ -626,6 +626,15 @@ def _add_day(day: str) -> str:
     return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
 
 
+def _rough_estimate(windows: int, seconds_each: int = 25) -> str:
+    """A pre-flight figure, so a multi-hour walk is a choice rather than a surprise."""
+    total = windows * seconds_each
+    if total < 120:
+        return ""
+    hours, minutes = divmod(total // 60, 60)
+    return f" — roughly {hours}h{minutes:02d}m" if hours else f" — roughly {minutes}m"
+
+
 def _eta(started: float, done: int, total: int) -> str:
     """A rough finish estimate, because a silent 30-minute walk reads as hung."""
     if not total or done < 1 or done >= total:
@@ -710,8 +719,9 @@ def fetch_user_search(
     handle: str,
     since: str | None = None,
     until: str | None = None,
-    window_days: int = 14,
+    window_days: int | None = None,
     max_posts: int = 20000,
+    time_budget_s: float | None = None,
     max_empty_windows: int = 8,
     replies: str = "include",
     windows: list | None = None,
@@ -765,11 +775,15 @@ def fetch_user_search(
         sink.write(collect_posts(payload, target, collected, seen_handles))
 
     pending: list[tuple[str, str, bool]] = []  # (start, end, is_continuation)
+    effective_window = window_days or 14
     if windows is not None:
         pending = [(s, e, False) for s, e in windows]
         open_ended = False
     elif not open_ended:
-        pending = [(s, e, False) for s, e in date_windows(since_date, end_date, window_days)]
+        span = (end_date - since_date).days
+        effective_window = window_days or auto_window_days(span)
+        pending = [(s, e, False)
+                   for s, e in date_windows(since_date, end_date, effective_window)]
     if order == "oldest":
         # Oldest first, so the history you're missing arrives before the
         # recent months you probably already have.
@@ -778,7 +792,7 @@ def fetch_user_search(
     attempted: set[tuple[str, str]] = set()
     cursor = end_date
     windows_done, extra, empty_streak, truncated = 0, 0, 0, []
-    examined = None
+    examined, budget_hit = None, False
     started = time.monotonic()
 
     with sync_playwright() as p:
@@ -818,8 +832,11 @@ def fetch_user_search(
                         "Pass --since (e.g. --since 2025-10-01)."
                     )
                 gap_end = (until or "")[:10] or (date.today() + timedelta(days=1)).isoformat()
-                plan = gap_windows(stored_days, gap_start, gap_end, window_days, min_gap_days)
+                span = (date.fromisoformat(gap_end) - date.fromisoformat(gap_start)).days
+                chosen = window_days or auto_window_days(span)
+                plan = gap_windows(stored_days, gap_start, gap_end, chosen, min_gap_days)
                 examined = (gap_start, gap_end)
+                effective_window = chosen
                 pending = [(w_start, w_end, False) for w_start, w_end in plan]
                 if order == "oldest":
                     pending.reverse()
@@ -827,17 +844,24 @@ def fetch_user_search(
                 open_ended = False
                 if verbose:
                     if pending:
-                        print(f"  {len(pending)} window(s) with no posts stored "
-                              f"between {gap_start} and {gap_end}")
+                        print(f"  {len(pending)} window(s) of {chosen} days with no "
+                              f"posts stored between {gap_start} and {gap_end}"
+                              f"{_rough_estimate(len(pending))}")
                     else:
                         print(f"  {gap_start} \u2192 {gap_end} is already covered "
                               f"(no blanks of {min_gap_days}+ days)")
 
             while len(collected) < max_posts:
+                if time_budget_s and time.monotonic() - started > time_budget_s:
+                    budget_hit = True
+                    if verbose:
+                        print(f"  time budget reached — {len(pending)} window(s) left. "
+                              "Re-run with --fill-gaps to carry on.")
+                    break
                 if not pending:
                     if not open_ended or cursor <= floor:
                         break
-                    start = max(floor, cursor - timedelta(days=window_days))
+                    start = max(floor, cursor - timedelta(days=effective_window))
                     pending.append((start.isoformat(), cursor.isoformat(), False))
                     cursor = start
 
@@ -901,6 +925,10 @@ def fetch_user_search(
         continuations=extra,
         truncated=truncated,
         examined=examined,
+        budget_hit=budget_hit,
+        window_days=effective_window,
+        remaining=len(pending),
+        elapsed_s=round(time.monotonic() - started),
         missing_views=sum(1 for r in collected.values() if r.get("views") is None),
         skipped_other_authors=sum(n for h, n in seen_handles.items() if h != target),
         operations=seen_ops,
@@ -909,6 +937,20 @@ def fetch_user_search(
     if not collected:
         stats["error"] = no_posts_message(target, [], seen_handles, seen_ops, errors)
     return stats
+
+
+def auto_window_days(span_days: int, target_windows: int = 60) -> int:
+    """Pick a window size from the span being covered.
+
+    A fixed small window is wrong at both ends: five-day windows over nine years
+    is ~700 page loads, most of them across quiet stretches, while a big window
+    over a busy month gets truncated. Truncated windows now continue from their
+    cut-off point, so starting coarse is safe — the narrowing happens only where
+    the volume actually demands it.
+    """
+    if span_days <= 0:
+        return 5
+    return max(5, min(45, span_days // target_windows or 5))
 
 
 def gap_anchor(since: str | None, profile_created_at: str | None, stored_days: set) -> str | None:
